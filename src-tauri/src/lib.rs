@@ -3045,19 +3045,63 @@ struct XInputBatteryInformation {
 }
 
 #[cfg(target_os = "windows")]
-#[link(name = "xinput1_4")]
-#[allow(non_snake_case)]
+type XInputGetStateFn =
+    unsafe extern "system" fn(user_index: u32, state: *mut XInputState) -> u32;
+#[cfg(target_os = "windows")]
+type XInputGetBatteryInformationFn = unsafe extern "system" fn(
+    user_index: u32,
+    device_type: u8,
+    battery: *mut XInputBatteryInformation,
+) -> u32;
+
+/// `xinput1_4.lib` n'est pas fourni par tous les SDK Windows : les fonctions
+/// sont résolues dans la DLL à l'exécution, sans dépendance à l'édition de liens.
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
 unsafe extern "system" {
-    fn XInputGetState(user_index: u32, state: *mut XInputState) -> u32;
-    fn XInputGetBatteryInformation(
-        user_index: u32,
-        device_type: u8,
-        battery: *mut XInputBatteryInformation,
-    ) -> u32;
+    fn LoadLibraryA(name: *const u8) -> *mut std::ffi::c_void;
+    fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
+}
+
+#[cfg(target_os = "windows")]
+fn load_xinput() -> Option<(XInputGetStateFn, XInputGetBatteryInformationFn)> {
+    for dll in [
+        b"xinput1_4.dll\0".as_slice(),
+        b"xinput9_1_0.dll\0".as_slice(),
+    ] {
+        let module = unsafe { LoadLibraryA(dll.as_ptr()) };
+        if module.is_null() {
+            continue;
+        }
+        let get_state = unsafe { GetProcAddress(module, b"XInputGetState\0".as_ptr()) };
+        let get_battery =
+            unsafe { GetProcAddress(module, b"XInputGetBatteryInformation\0".as_ptr()) };
+        if get_state.is_null() || get_battery.is_null() {
+            continue;
+        }
+        // SAFETY: signatures documentées par XInput ; la DLL reste chargée.
+        return Some(unsafe {
+            (
+                std::mem::transmute::<*mut std::ffi::c_void, XInputGetStateFn>(get_state),
+                std::mem::transmute::<*mut std::ffi::c_void, XInputGetBatteryInformationFn>(
+                    get_battery,
+                ),
+            )
+        });
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn xinput_api() -> Option<(XInputGetStateFn, XInputGetBatteryInformationFn)> {
+    static API: std::sync::OnceLock<
+        Option<(XInputGetStateFn, XInputGetBatteryInformationFn)>,
+    > = std::sync::OnceLock::new();
+    *API.get_or_init(load_xinput)
 }
 
 /// XInput expose la charge des manettes sans fil (Bluetooth inclus) et signale
-/// les manettes filaires. Appel direct dans `xinput1_4.dll`, sans dépendance.
+/// les manettes filaires. Fonctions chargées dynamiquement depuis la DLL.
 #[cfg(target_os = "windows")]
 fn controller_battery() -> Option<u8> {
     const ERROR_SUCCESS: u32 = 0;
@@ -3065,16 +3109,18 @@ fn controller_battery() -> Option<u8> {
     const BATTERY_TYPE_DISCONNECTED: u8 = 0;
     const BATTERY_TYPE_WIRED: u8 = 1;
 
+    let (xinput_get_state, xinput_get_battery) = xinput_api()?;
+
     for index in 0..4u32 {
         let mut state = XInputState::default();
-        let connected = unsafe { XInputGetState(index, &mut state) } == ERROR_SUCCESS;
+        let connected = unsafe { xinput_get_state(index, &mut state) } == ERROR_SUCCESS;
         if !connected {
             continue;
         }
 
         let mut battery = XInputBatteryInformation::default();
         let known = unsafe {
-            XInputGetBatteryInformation(index, BATTERY_DEVTYPE_GAMEPAD, &mut battery)
+            xinput_get_battery(index, BATTERY_DEVTYPE_GAMEPAD, &mut battery)
         } == ERROR_SUCCESS;
         if !known {
             // Manette connectée mais charge inconnue : on l'affiche pleine
