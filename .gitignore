@@ -1,0 +1,5 @@
+node_modules/
+dist/
+src-tauri/target/
+_ref-ps4/
+.DS_Store
