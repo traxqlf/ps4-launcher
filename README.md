@@ -104,3 +104,4 @@ To build and run this project from the source code, you will need:
    ```bash
    npm run tauri build
    ```
+
