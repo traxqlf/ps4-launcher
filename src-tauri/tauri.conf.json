@@ -47,7 +47,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY3N0U2NkRFMTI1NzhCQzUKUldURmkxY1MzbVorWjBlWDM2Zm9GU29RWTNSa1h5QlhoMEVGdkdKNE1OeWZFdXozVGprVWkxZ24K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ1OTJGMDczRkQ3MEQ3MTUKUldRVjEzRDljL0NTUmVrQU16OWpPd3JkVm5pQXFncHJPVXpPSHB4L2Y1UjRkL2R4L05WbVhzdjYK",
       "endpoints": [
         "https://github.com/traxqlf/ps4-launcher/releases/latest/download/latest.json"
       ]
