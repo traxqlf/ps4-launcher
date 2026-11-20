@@ -3147,6 +3147,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .register_uri_scheme_protocol(COVERS_SCHEME, |ctx, request| {
             let not_found = |status: u16| {
                 tauri::http::Response::builder()
