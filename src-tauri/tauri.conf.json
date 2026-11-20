@@ -36,6 +36,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -43,5 +44,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY3N0U2NkRFMTI1NzhCQzUKUldURmkxY1MzbVorWjBlWDM2Zm9GU29RWTNSa1h5QlhoMEVGdkdKNE1OeWZFdXozVGprVWkxZ24K",
+      "endpoints": [
+        "https://github.com/traxqlf/ps4-launcher/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

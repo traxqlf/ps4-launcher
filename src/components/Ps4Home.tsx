@@ -4,6 +4,8 @@ import { avatarSrc } from "../utils/avatar";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { TrophyModal, type TrophyReport } from "./TrophyModal";
 import { ProfileModal } from "./ProfileModal";
 import { notify } from "./Ps4Notification";
@@ -33,6 +35,7 @@ import {
   playNav,
   playNegative,
   playNotification,
+  playSystemMessage,
   playThemeMusic,
   playTrophy,
   resumeAudioEngine,
@@ -472,6 +475,56 @@ export function Ps4Home({
   // Une validation clavier peut aussi activer le bouton qui a le focus : on
   // n'ouvre qu'une seule fenêtre par appui.
   const lastStoreOpen = useRef(0);
+
+  // Mise à jour du logiciel système : détection unique au démarrage, puis
+  // bandeau PS4 cliquable en haut à gauche.
+  const [systemUpdate, setSystemUpdate] = useState<Update | null>(null);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const updateCheckStarted = useRef(false);
+
+  useEffect(() => {
+    // Production uniquement : en dev, la vérification interrogerait la release
+    // publiée alors que le binaire local n'est pas signé.
+    if (import.meta.env.DEV || updateCheckStarted.current) return;
+    updateCheckStarted.current = true;
+    let cancelled = false;
+
+    const lookForUpdate = async () => {
+      try {
+        const found = await check();
+        if (cancelled || !found) return;
+        setSystemUpdate(found);
+        playSystemMessage();
+      } catch (caught) {
+        console.error("[mise à jour] vérification impossible:", caught);
+      }
+    };
+
+    void lookForUpdate();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Clic sur le bandeau : téléchargement, installation, puis redémarrage du
+  // launcher. En cas d'échec le bandeau reste affiché pour réessayer.
+  const installSystemUpdate = async () => {
+    if (!systemUpdate || installingUpdate) return;
+    setInstallingUpdate(true);
+    setUpdateError(null);
+    playDialogYes();
+    try {
+      await systemUpdate.downloadAndInstall();
+      await relaunch();
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      console.error("[mise à jour] installation impossible:", caught);
+      setInstallingUpdate(false);
+      setUpdateError(message);
+      playError();
+    }
+  };
 
   // Moteur du ruban : les refs DOM et l'état physique restent hors de React,
   // seule la sélection change d'un rendu à l'autre.
@@ -2361,6 +2414,57 @@ export function Ps4Home({
         ) : null}
         <div className="ps4-vignette absolute inset-0" />
       </div>
+
+      {/* Mise à jour système : bandeau PS4 en haut à gauche, affiché jusqu'au
+          clic. Le son système accompagne son apparition. */}
+      {systemUpdate ? (
+        <div className="absolute left-0 top-8 z-[55] w-[21rem]" style={SST_STYLE}>
+          <button
+            type="button"
+            onClick={() => void installSystemUpdate()}
+            disabled={installingUpdate}
+            title={
+              updateError ??
+              "Mise à jour du logiciel système disponible — Cliquez pour installer"
+            }
+            className="pointer-events-auto relative flex w-full items-center gap-3 rounded-r-xl bg-[#101828]/90 py-3 pl-5 pr-6 text-left shadow-[0_18px_40px_rgba(0,0,0,0.55)] backdrop-blur-md transition hover:bg-[#1b2b4b]/90 disabled:cursor-default"
+          >
+            <span
+              aria-hidden="true"
+              className="absolute left-0 top-1/2 h-11 w-[3px] -translate-y-1/2 rounded-r-full bg-white"
+            />
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white/10 text-white">
+              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+                <path
+                  d="M12 4.2v8.6m0 0 3.4-3.4M12 12.8 8.6 9.4"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M4.8 15.2v2.4a2 2 0 0 0 2 2h10.4a2 2 0 0 0 2-2v-2.4"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </span>
+            <span className="min-w-0">
+              <span className="block truncate text-sm font-bold leading-tight text-white">
+                Mise à jour du logiciel système disponible
+              </span>
+              <span className="mt-0.5 block truncate text-xs font-normal text-white/65">
+                {updateError
+                  ? "Échec de l'installation — cliquez pour réessayer"
+                  : installingUpdate
+                    ? "Installation en cours…"
+                    : "Cliquez pour installer"}
+              </span>
+            </span>
+          </button>
+        </div>
+      ) : null}
 
       <div className="ps4-screen z-10">
         {/* Zone 1 — barre système */}
