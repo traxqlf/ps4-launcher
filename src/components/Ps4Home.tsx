@@ -1,4 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type WheelEvent as ReactWheelEvent,
+} from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { avatarSrc } from "../utils/avatar";
 import { listen } from "@tauri-apps/api/event";
@@ -16,7 +22,9 @@ import { Ps4SplashScreen } from "./Ps4SplashScreen";
 import {
   hasSystemModifier,
   isMenuKey,
+  isGamepadSuspended,
   isTypingTarget,
+  setGamepadSuspended,
   setGlobalGamepadLock,
   useGamepad,
 } from "../hooks/useGamepad";
@@ -65,8 +73,8 @@ interface Ps4HomeProps {
   onAdd: () => void;
   /** Épingle / désépingle un jeu en tête du ruban. */
   onTogglePin: (gameId: string) => void;
-  onLaunch: () => void;
-  onLaunchGame: (gameId: string) => void;
+  onLaunch: () => void | Promise<void>;
+  onLaunchGame: (gameId: string) => void | Promise<void>;
   onRequestDelete: () => void;
   onConfirmDelete: () => void;
   onCancelDelete: () => void;
@@ -139,6 +147,14 @@ const MAX_FRAME_DT = 0.032;
 const START_IMPULSE = 0.35;
 // Durée de l'écran de démarrage avant de lancer réellement l'exécutable.
 const SPLASH_MS = 1800;
+// Durée minimale du splash : l'animation et le son PS4 se jouent en entier.
+const SPLASH_MIN_MS = 2800;
+// Attente maximale de la fenêtre du jeu avant de rendre la main.
+const SPLASH_TIMEOUT_MS = 45000;
+// Molette / trackpad : un pas de sélection par seuil franchi, verrouillé le
+// temps que l'inertie d'un geste rapide ne saute pas plusieurs tuiles.
+const WHEEL_STEP_THRESHOLD = 45;
+const WHEEL_STEP_COOLDOWN_MS = 130;
 
 const du = (value: number) => `calc(${value} * var(--u))`;
 
@@ -224,6 +240,11 @@ interface GameSessionEnded {
   exitCode?: number | null;
   /** Session très courte terminée avec un code non nul. */
   crashed?: boolean;
+}
+
+/** Fenêtre du jeu affichée : le splash peut se fermer. */
+interface GameWindowReady {
+  gameId: string;
 }
 
 function formatPlaytime(seconds: number): string {
@@ -425,12 +446,25 @@ export function Ps4Home({
   const [toastVisible, setToastVisible] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   // Jeu en cours de démarrage : l'écran plein écran reste affiché jusqu'à la
-  // minimisation du launcher (ou le retour au launcher en fin de session).
+  // première image du jeu (ou le timeout de 45 s).
   const [launchingGame, setLaunchingGame] = useState<Game | null>(null);
+  // Verrou synchrone : l'état React n'est pas visible dans le handler suivant
+  // (clavier, clic natif, manette). Ce ref empêche trois entrées simultanées
+  // de préparer trois lancements du même exécutable.
+  const isLaunchingRef = useRef(false);
+  // Vrai dès que la commande Rust a réellement été déclenchée : un splash
+  // annulé ou expiré ne doit pas libérer le verrou d'une session en cours.
+  const launchInvokedRef = useRef(false);
+  // Session de jeu au-delà du splash : aucune requête de thème ni boucle de
+  // manette tant que le jeu tourne (0 % CPU pour le launcher).
+  const [gameSessionActive, setGameSessionActive] = useState(false);
+  // Fermeture du splash courant : partagée par le timeout, la manette et Échap.
+  const closeSplashRef = useRef<(() => void) | null>(null);
   const [bgmMuted, setBgmMuted] = useState(isBgmMuted);
   // Pourcentage de batterie de la manette (None hors Windows / sans manette).
   const [batteryLevel, setBatteryLevel] = useState<number | null>(null);
   const [regeneratingTheme, setRegeneratingTheme] = useState(false);
+  const [deletingTheme, setDeletingTheme] = useState(false);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [optionsOpen, setOptionsOpen] = useState(false);
@@ -531,6 +565,9 @@ export function Ps4Home({
   const ribbonRef = useRef<HTMLDivElement | null>(null);
   const tileRefs = useRef<(HTMLElement | null)[]>([]);
   const activeIndexRef = useRef(0);
+  // Accumulateur de molette : aucune boucle, uniquement l'événement onWheel.
+  const wheelAccumulatorRef = useRef(0);
+  const lastWheelStepRef = useRef(0);
   const motion = useRef({
     x: 0,
     velocity: 0,
@@ -543,8 +580,12 @@ export function Ps4Home({
   const optionsCopyRef = useRef<HTMLButtonElement | null>(null);
   const optionsSaveRef = useRef<HTMLButtonElement | null>(null);
   const optionsCancelRef = useRef<HTMLButtonElement | null>(null);
+  const optionsRegenRef = useRef<HTMLButtonElement | null>(null);
+  const optionsDeleteRef = useRef<HTMLButtonElement | null>(null);
   const optionsCursorRef = useRef(optionsCursor);
   optionsCursorRef.current = optionsCursor;
+  const optionsGameRef = useRef(optionsGame);
+  optionsGameRef.current = optionsGame;
   const saveOptionsRef = useRef<() => void>(() => {});
   const closeOptionsRef = useRef<() => void>(() => {});
 
@@ -787,6 +828,8 @@ export function Ps4Home({
     const onFocus = () => {
       resumeAudioEngine();
       resumeBgm();
+      // Retour au launcher : la boucle manette reprend son polling.
+      setGamepadSuspended(false);
     };
     const onBlur = () => {
       suspendAudioEngine();
@@ -851,6 +894,12 @@ export function Ps4Home({
     // terminés) : la liste est dans le payload, l'affichage suit immédiatement.
     const handleUpdated = (payload: Game[]) => {
       resumeBgm();
+      // Tous les processus du jeu sont terminés : la file de musiques peut
+      // reprendre, le launcher retrouve un état actif et un nouveau lancement
+      // est autorisé.
+      setGameSessionActive(false);
+      isLaunchingRef.current = false;
+      launchInvokedRef.current = false;
       if (Array.isArray(payload)) applyGames(payload);
       else refresh();
     };
@@ -876,10 +925,14 @@ export function Ps4Home({
 
     const creditPlaytime = (payload: GameSessionEnded) => {
       if (disposed || typeof payload?.gameId !== "string") return;
-      // Le launcher retrouve la main : le moteur audio et la musique reviennent.
+      // Le launcher retrouve la main : moteur audio, musique et boucle manette.
       resumeAudioEngine();
       resumeBgm();
+      setGamepadSuspended(false);
       setLaunchingGame(null);
+      setGameSessionActive(false);
+      isLaunchingRef.current = false;
+      launchInvokedRef.current = false;
 
       if (payload.crashed) {
         notify({
@@ -1060,6 +1113,8 @@ export function Ps4Home({
   const themeQueuedRef = useRef(new Set<string>());
   const themeFailedRef = useRef(new Set<string>());
   const themeRunningRef = useRef(false);
+  const themePausedRef = useRef(false);
+  const themeBusyRef = useRef(false);
   const allGamesRef = useRef(allGames);
   allGamesRef.current = allGames;
   const launchingGameRef = useRef(launchingGame);
@@ -1111,11 +1166,33 @@ export function Ps4Home({
     stopThemeMusic(300);
   }
 
+  /** Applique une liste renvoyée par Rust au ruban et au panneau d'options. */
+  function applyThemeList(list: Game[], gameId: string) {
+    setLiveGames(Object.fromEntries(list.map((game) => [game.id, game])));
+    const updated = list.find((game) => game.id === gameId);
+    if (updated) {
+      setOptionsGame((current) =>
+        current && current.id === gameId ? updated : current,
+      );
+    }
+  }
+
+  function isThemeCancellation(cause: unknown) {
+    return String(cause).includes("téléchargement annulé");
+  }
+
   async function pumpThemeQueue() {
-    if (themeRunningRef.current) return;
+    if (themeRunningRef.current || themePausedRef.current) return;
     themeRunningRef.current = true;
+    let interrupted = false;
     try {
       while (themeQueueRef.current.length > 0) {
+        // Jeu en cours, splash ou fenêtre masquée : aucune requête réseau et
+        // aucun processus yt-dlp laissé actif.
+        if (themePausedRef.current) {
+          interrupted = true;
+          break;
+        }
         const next = themeQueueRef.current.shift();
         if (!next) break;
         try {
@@ -1127,17 +1204,50 @@ export function Ps4Home({
             gameId: next.id,
             themeAudioPath: path,
           });
-          setLiveGames(Object.fromEntries(list.map((game) => [game.id, game])));
+          applyThemeList(list, next.id);
         } catch (cause) {
-          // Session sans réseau : on n'insiste pas avant le prochain démarrage.
+          if (isThemeCancellation(cause)) {
+            // Le jeu vient de démarrer : on remet la piste en tête de file et
+            // elle repartira à la fin de la session.
+            themeQueueRef.current.unshift(next);
+            interrupted = true;
+            break;
+          }
+          // Aucun résultat fiable ou session sans réseau : on n'insiste pas
+          // avant le prochain démarrage.
           themeFailedRef.current.add(next.id);
           console.warn(`[thème] ${next.title}:`, cause);
         }
       }
     } finally {
       themeRunningRef.current = false;
+      if (
+        !interrupted &&
+        !themePausedRef.current &&
+        themeQueueRef.current.length > 0
+      ) {
+        window.setTimeout(() => void pumpThemeQueue(), 0);
+      }
     }
   }
+
+  // Une session de jeu (ou une fenêtre masquée) coupe immédiatement yt-dlp et
+  // gèle la file ; la reprise relance le téléchargement resté en attente.
+  const themeFetchBlocked =
+    launchingGame !== null || gameSessionActive || appHidden;
+  useEffect(() => {
+    themePausedRef.current = themeFetchBlocked;
+    if (themeFetchBlocked) {
+      void invoke("cancel_theme_fetch").catch((cause) =>
+        console.warn("[thème] pause impossible:", cause),
+      );
+      return;
+    }
+    void invoke("resume_theme_fetch")
+      .catch((cause) => console.warn("[thème] reprise impossible:", cause))
+      .finally(() => void pumpThemeQueue());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [themeFetchBlocked]);
 
   // File séquentielle : un téléchargement à la fois, sans bloquer l'interface.
   useEffect(() => {
@@ -1167,6 +1277,7 @@ export function Ps4Home({
       Boolean(path) &&
       !bgmMuted &&
       !launchingGame &&
+      !gameSessionActive &&
       !libraryOpen;
     if (shouldPlay && path) startThemeAudio(path);
     else stopThemeAudio();
@@ -1177,21 +1288,34 @@ export function Ps4Home({
     selected?.themeAudioPath,
     bgmMuted,
     launchingGame,
+    gameSessionActive,
     libraryOpen,
     audioOpen,
   ]);
 
   async function regenerateTheme() {
-    const game = optionsGame;
-    if (!game || regeneratingTheme) return;
+    const game = optionsGameRef.current;
+    if (!game || themeBusyRef.current) return;
+    if (themePausedRef.current) {
+      setOptionsError("Recherche suspendue pendant une session de jeu.");
+      return;
+    }
+    themeBusyRef.current = true;
     setRegeneratingTheme(true);
+    setOptionsError(null);
     // La file ne doit pas doubler le téléchargement de ce jeu.
     themeQueueRef.current = themeQueueRef.current.filter(
       (item) => item.id !== game.id,
     );
+    themeQueuedRef.current.delete(game.id);
     themeFailedRef.current.delete(game.id);
     try {
-      await invoke<Game[]>("clear_game_theme", { gameId: game.id });
+      // La piste existante disparaît avant la recherche : si aucun candidat ne
+      // passe le seuil, aucune musique douteuse ne reste associée au jeu.
+      const cleared = await invoke<Game[]>("clear_game_theme", {
+        gameId: game.id,
+      });
+      applyThemeList(cleared, game.id);
       const path = await invoke<string>("fetch_game_theme_auto", {
         gameId: game.id,
         gameTitle: game.title,
@@ -1200,15 +1324,50 @@ export function Ps4Home({
         gameId: game.id,
         themeAudioPath: path,
       });
-      setLiveGames(Object.fromEntries(list.map((item) => [item.id, item])));
+      applyThemeList(list, game.id);
       themeQueuedRef.current.add(game.id);
-      playNotification();
+      playConfirm();
     } catch (cause) {
       themeFailedRef.current.add(game.id);
       playError();
-      setOptionsError(`Musique auto: ${String(cause)}`);
+      console.warn(`[thème] régénération de « ${game.title} »:`, cause);
+      setOptionsError(
+        isThemeCancellation(cause)
+          ? "Recherche interrompue — réessayez hors session de jeu."
+          : "Aucune bande-son validée — thème PS4 par défaut.",
+      );
     } finally {
+      themeBusyRef.current = false;
       setRegeneratingTheme(false);
+    }
+  }
+
+  /** Supprime la piste validée et empêche la file de la retélécharger aussitôt. */
+  async function deleteTheme() {
+    const game = optionsGameRef.current;
+    if (!game || themeBusyRef.current) return;
+    themeBusyRef.current = true;
+    setDeletingTheme(true);
+    setOptionsError(null);
+    themeQueueRef.current = themeQueueRef.current.filter(
+      (item) => item.id !== game.id,
+    );
+    themeQueuedRef.current.delete(game.id);
+    try {
+      const list = await invoke<Game[]>("clear_game_theme", {
+        gameId: game.id,
+      });
+      applyThemeList(list, game.id);
+      themeFailedRef.current.add(game.id);
+      playConfirm();
+      // Le bouton Supprimer disparaît : le focus revient sur Régénérer.
+      focusOptionItem(4);
+    } catch (cause) {
+      playError();
+      setOptionsError(String(cause));
+    } finally {
+      themeBusyRef.current = false;
+      setDeletingTheme(false);
     }
   }
 
@@ -1551,23 +1710,35 @@ export function Ps4Home({
       : "border-transparent !opacity-75";
   }
 
-  // Éléments navigables : arguments, Copier, Enregistrer, Annuler. La case
+  // Éléments navigables : arguments, Copier, Enregistrer, Annuler, Régénérer
+  // puis Supprimer (uniquement quand une piste validée existe). La case
   // d'emplacement reste hors du parcours (tabIndex -1) pour ne pas piéger les
   // flèches dans un champ en lecture seule.
-  function focusOptionItem(index: number) {
-    setOptionsCursor(index);
-    const targets = [
+  function optionTargets() {
+    const targets: (HTMLButtonElement | HTMLInputElement | null)[] = [
       optionsInputRef.current,
       optionsCopyRef.current,
       optionsSaveRef.current,
       optionsCancelRef.current,
+      optionsRegenRef.current,
     ];
-    targets[index]?.focus();
+    if (optionsGameRef.current?.themeAudioPath) {
+      targets.push(optionsDeleteRef.current);
+    }
+    return targets;
+  }
+
+  function focusOptionItem(index: number) {
+    const targets = optionTargets();
+    const bounded = Math.max(0, Math.min(index, targets.length - 1));
+    setOptionsCursor(bounded);
+    targets[bounded]?.focus();
   }
 
   function moveOptionsCursor(delta: number) {
     playNav();
-    focusOptionItem((optionsCursorRef.current + delta + 4) % 4);
+    const count = optionTargets().length;
+    focusOptionItem((optionsCursorRef.current + delta + count) % count);
   }
 
   function activateOptionItem() {
@@ -1585,6 +1756,14 @@ export function Ps4Home({
     }
     if (index === 2) {
       saveOptionsRef.current();
+      return;
+    }
+    if (index === 4) {
+      void regenerateTheme();
+      return;
+    }
+    if (index === 5) {
+      void deleteTheme();
       return;
     }
     closeOptionsRef.current();
@@ -1994,7 +2173,18 @@ export function Ps4Home({
 
   /** Démarre l'écran de démarrage puis, après l'animation, le jeu demandé. */
   function startLaunch(game: Game, action: () => void | Promise<void>) {
-    if (isPermanentTile(game) || launchingGame || busy) return;
+    // Verrou synchrone prioritaire : il couvre le clavier, le clic natif du
+    // bouton Démarrer et la manette, même avant le prochain rendu React.
+    if (
+      isLaunchingRef.current ||
+      isPermanentTile(game) ||
+      launchingGame ||
+      busy
+    ) {
+      return;
+    }
+    isLaunchingRef.current = true;
+    launchInvokedRef.current = false;
     launchActionRef.current = action;
     // Le splash coupe immédiatement le thème du tiroir : la ref est mise à jour
     // tout de suite pour que stopThemeAudio ne relance pas la musique du menu.
@@ -2021,22 +2211,130 @@ export function Ps4Home({
 
   /** Lancement depuis la grille : la vue se referme sur l'écran de démarrage. */
   function launchFromLibrary(game: Game) {
-    if (isPermanentTile(game) || launchingGame || busy) return;
+    if (
+      isLaunchingRef.current ||
+      isPermanentTile(game) ||
+      launchingGame ||
+      busy
+    ) {
+      return;
+    }
     setLibraryOpen(false);
     startLaunch(game, () => onLaunchGameRef.current(game.id));
   }
 
-  // Après l'animation, on lance l'exécutable : Rust minimise la fenêtre, ce qui
-  // masque l'écran de démarrage. L'événement `game-session-ended` le masque
-  // aussi au retour, si le launcher n'a pas déjà repris la main.
+  /** Ferme le splash en cours (jeu prêt, timeout ou annulation manuelle). */
+  function cancelSplash() {
+    const close = closeSplashRef.current;
+    if (!close) return;
+    close();
+    // Le jeu déjà lancé continue : la musique du menu revient en attendant.
+    resumeBgm();
+  }
+  // Le splash reste au premier plan tant que le jeu n'a pas affiché sa
+  // première image, avec une durée minimale et un plafond de 45 s. Rust émet
+  // `game-window-ready` ; le splash ne se ferme que quand les deux conditions
+  // (durée minimale + fenêtre prête) sont réunies. Au-delà de 45 s, on rend
+  // l'accueil plutôt que de laisser le launcher masquer un jeu introuvable.
   useEffect(() => {
     if (!launchingGame) return;
-    const timer = window.setTimeout(() => {
-      void Promise.resolve(launchActionRef.current()).finally(() => {
-        setLaunchingGame(null);
+    const gameId = launchingGame.id;
+    const appWindow = getCurrentWindow();
+    let closed = false;
+    let minElapsed = false;
+    let windowReady = false;
+    let unlisten: (() => void) | undefined;
+    let minTimer = 0;
+    let timeoutTimer = 0;
+    let launchTimer = 0;
+
+    const closeSplash = (gameRunning: boolean) => {
+      if (closed) return;
+      closed = true;
+      closeSplashRef.current = null;
+      // Splash refermé avant tout appel Rust : rien n'a été lancé, on peut
+      // réessayer. Après un appel Rust, le verrou reste tenu jusqu'à la fin
+      // réelle de la session (événement games-updated / game-session-ended).
+      if (!gameRunning && !launchInvokedRef.current) {
+        isLaunchingRef.current = false;
+      }
+      window.clearTimeout(minTimer);
+      window.clearTimeout(timeoutTimer);
+      window.clearTimeout(launchTimer);
+      unlisten?.();
+      // Jeu en cours : moteur Web Audio et polling manette suspendus à 0 % CPU
+      // jusqu'au retour au launcher.
+      if (gameRunning) {
+        suspendAudioEngine();
+        setGamepadSuspended(true);
+        // Couvre toute la session, pas seulement le splash : lancement, jeu
+        // en cours, minimisation puis retour au launcher.
+        setGameSessionActive(true);
+      }
+      void appWindow
+        .setAlwaysOnTop(false)
+        .catch((cause) => console.warn("[splash] alwaysOnTop:", cause));
+      setLaunchingGame(null);
+    };
+    // Fermeture manuelle (Rond / Échap) : aucun jeu considéré comme lancé.
+    closeSplashRef.current = () => closeSplash(false);
+
+    const maybeClose = () => {
+      if (minElapsed && windowReady) closeSplash(true);
+    };
+
+    void appWindow
+      .setAlwaysOnTop(true)
+      .catch((cause) => console.warn("[splash] alwaysOnTop:", cause));
+
+    minTimer = window.setTimeout(() => {
+      minElapsed = true;
+      maybeClose();
+    }, SPLASH_MIN_MS);
+    timeoutTimer = window.setTimeout(() => {
+      // Fenêtre introuvable : on rend l'accueil et sa musique.
+      closeSplash(false);
+      resumeBgm();
+    }, SPLASH_TIMEOUT_MS);
+
+    listen<GameWindowReady>("game-window-ready", (event) => {
+      if (event.payload?.gameId !== gameId) return;
+      windowReady = true;
+      maybeClose();
+    })
+      .then((stop) => {
+        if (closed) stop();
+        else unlisten = stop;
+      })
+      .catch((cause) => console.error("Écoute game-window-ready:", cause));
+
+    let launchRequested = false;
+    launchTimer = window.setTimeout(() => {
+      // Un seul appel Rust par splash, même si l'effet a été recréé.
+      if (launchRequested) return;
+      launchRequested = true;
+      launchInvokedRef.current = true;
+      void Promise.resolve(launchActionRef.current()).catch((cause) => {
+        // Échec du processus : App a affiché l'erreur, on rend l'accueil et
+        // on libère le verrou pour permettre une nouvelle tentative.
+        console.error("Lancement du jeu:", cause);
+        launchInvokedRef.current = false;
+        // Même si le splash a déjà été refermé manuellement, l'échec de la
+        // commande Rust doit libérer le verrou de lancement.
+        isLaunchingRef.current = false;
+        closeSplash(false);
       });
     }, SPLASH_MS);
-    return () => window.clearTimeout(timer);
+
+    return () => {
+      closed = true;
+      closeSplashRef.current = null;
+      window.clearTimeout(minTimer);
+      window.clearTimeout(timeoutTimer);
+      window.clearTimeout(launchTimer);
+      unlisten?.();
+      void appWindow.setAlwaysOnTop(false).catch(() => {});
+    };
   }, [launchingGame]);
 
   function addGame() {
@@ -2289,6 +2587,47 @@ export function Ps4Home({
   }
 
   /**
+   * Molette et trackpad sur le bandeau : même chemin que le clavier et la
+   * manette (`playNav` + `onSelect`), donc même recentrage, même tiroir et même
+   * bruitage. L'accumulation et le verrou temporel évitent les sauts de tuiles
+   * sur l'inertie d'un geste ; aucune boucle n'est créée.
+   */
+  function handleRibbonWheel(event: ReactWheelEvent<HTMLDivElement>) {
+    // Modale, Bibliothèque, tiroir, menu du haut, splash ou jeu en cours :
+    // le bandeau ne consomme pas le geste.
+    if (inputBlocked || level !== "ribbon" || isGamepadSuspended()) return;
+    if (isTypingTarget(event.target)) return;
+
+    // Axe dominant : molette verticale (deltaY) ou balayage horizontal (deltaX).
+    const delta =
+      Math.abs(event.deltaX) > Math.abs(event.deltaY)
+        ? event.deltaX
+        : event.deltaY;
+    if (delta === 0) return;
+
+    // Le bandeau prend le défilement en charge : la page ne bouge pas.
+    event.preventDefault();
+
+    const now = performance.now();
+    if (now - lastWheelStepRef.current < WHEEL_STEP_COOLDOWN_MS) return;
+
+    wheelAccumulatorRef.current += delta;
+    if (Math.abs(wheelAccumulatorRef.current) < WHEEL_STEP_THRESHOLD) return;
+
+    const step = wheelAccumulatorRef.current > 0 ? 1 : -1;
+    wheelAccumulatorRef.current = 0;
+    lastWheelStepRef.current = now;
+
+    const next = Math.max(
+      0,
+      Math.min(displayGames.length - 1, activeIndex + step),
+    );
+    if (next === activeIndex) return;
+    playNav();
+    onSelect(next);
+  }
+
+  /**
    * Saut direct sur le ruban (gâchettes) : l'index est borné entre le
    * PlayStation Store (0) et la tuile Bibliothèque (dernière tuile).
    */
@@ -2341,20 +2680,22 @@ export function Ps4Home({
               setLevel("ribbon");
             } else openInfo();
           },
-    onBack: inputBlocked
-      ? undefined
-      : () => {
-          // Rond annule d'abord la confirmation de suppression, sans quitter le tiroir.
-          if (pendingDeleteId) {
-            playBack();
-            onCancelDelete();
-          } else if (level === "system") {
-            leaveHeader();
-          } else if (level !== "ribbon") {
-            playBack();
-            setLevel("ribbon");
-          }
-        },
+    onBack: launchingGame
+      ? cancelSplash
+      : inputBlocked
+        ? undefined
+        : () => {
+            // Rond annule d'abord la confirmation de suppression, sans quitter le tiroir.
+            if (pendingDeleteId) {
+              playBack();
+              onCancelDelete();
+            } else if (level === "system") {
+              leaveHeader();
+            } else if (level !== "ribbon") {
+              playBack();
+              setLevel("ribbon");
+            }
+          },
     // Gâchettes uniquement sur le ruban : le menu du haut et le tiroir gardent
     // leur navigation propre.
     onL1:
@@ -2474,6 +2815,7 @@ export function Ps4Home({
               type="button"
               onClick={openTrophies}
               onMouseEnter={() => focusHeader(0)}
+              onFocus={() => focusHeader(0)}
               disabled={!canOpenTrophies}
               title={
                 canOpenTrophies
@@ -2495,6 +2837,7 @@ export function Ps4Home({
               type="button"
               onClick={addGame}
               onMouseEnter={() => focusHeader(1)}
+              onFocus={() => focusHeader(1)}
               disabled={busy}
               style={{ transition: HEADER_TRANSITION }}
               className={`ps4-top-button rounded-[calc(6*var(--u))] border-2 px-[calc(14*var(--u))] py-[calc(8*var(--u))] ${headerFocusClass(1)}`}
@@ -2521,6 +2864,7 @@ export function Ps4Home({
               type="button"
               onClick={openProfile}
               onMouseEnter={() => focusHeader(2)}
+              onFocus={() => focusHeader(2)}
               title={
                 profile
                   ? `${profile.username} — En ligne`
@@ -2558,6 +2902,7 @@ export function Ps4Home({
               type="button"
               onClick={openAudio}
               onMouseEnter={() => focusHeader(3)}
+              onFocus={() => focusHeader(3)}
               title="Paramètres audio et égaliseur"
               aria-label="Paramètres audio et égaliseur"
               aria-pressed={bgmMuted}
@@ -2595,6 +2940,7 @@ export function Ps4Home({
               type="button"
               onClick={() => void quitApplication()}
               onMouseEnter={() => focusHeader(4)}
+              onFocus={() => focusHeader(4)}
               title="Alimentation"
               aria-label="Alimentation"
               style={{ transition: HEADER_TRANSITION }}
@@ -2627,6 +2973,7 @@ export function Ps4Home({
                   : ""
             }`}
             inert={level === "info" ? true : undefined}
+            onWheel={handleRibbonWheel}
           >
             {/* Piste défilante : la tuile active reste ancrée à gauche. */}
             <div
@@ -3476,6 +3823,11 @@ export function Ps4Home({
             <p className="mt-[calc(10*var(--u))] truncate text-[calc(22*var(--u))] text-white/60">
               {optionsGame.title}
             </p>
+            <p className="mt-[calc(6*var(--u))] text-[calc(20*var(--u))] text-white/50">
+              {optionsGame.themeAudioPath
+                ? "Bande-son : piste officielle validée"
+                : "Aucune bande-son validée — thème PS4 par défaut"}
+            </p>
 
             <div
               className="mt-[calc(26*var(--u))] h-[calc(2*var(--u))] bg-white/35"
@@ -3615,16 +3967,38 @@ export function Ps4Home({
               </button>
 
               <button
+                ref={optionsRegenRef}
                 type="button"
                 onClick={() => void regenerateTheme()}
-                onFocus={() => setOptionsCursor(-1)}
-                disabled={savingOptions || regeneratingTheme}
-                className="ml-auto text-[calc(20*var(--u))] text-white/50 underline-offset-4 outline-none transition hover:text-white hover:underline disabled:opacity-40"
+                onFocus={() => setOptionsCursor(4)}
+                disabled={savingOptions || regeneratingTheme || deletingTheme}
+                className={`ml-auto flex items-center border-[3px] px-[calc(22*var(--u))] py-[calc(10*var(--u))] text-[calc(22*var(--u))] outline-none transition disabled:opacity-40 ${
+                  optionsCursor === 4
+                    ? "border-white bg-[#00439c]/70 shadow-[0_0_calc(26*var(--u))_rgba(255,255,255,0.5)]"
+                    : "border-transparent bg-white/10 hover:border-white hover:bg-[#00439c]/60"
+                }`}
               >
                 {regeneratingTheme
-                  ? "Régénération de la musique…"
-                  : "Régénérer la musique auto"}
+                  ? "Recherche de la musique…"
+                  : "Régénérer la musique"}
               </button>
+
+              {optionsGame.themeAudioPath ? (
+                <button
+                  ref={optionsDeleteRef}
+                  type="button"
+                  onClick={() => void deleteTheme()}
+                  onFocus={() => setOptionsCursor(5)}
+                  disabled={savingOptions || regeneratingTheme || deletingTheme}
+                  className={`flex items-center border-[3px] px-[calc(22*var(--u))] py-[calc(10*var(--u))] text-[calc(22*var(--u))] outline-none transition disabled:opacity-40 ${
+                    optionsCursor === 5
+                      ? "border-white bg-red-900/60 shadow-[0_0_calc(26*var(--u))_rgba(255,255,255,0.4)]"
+                      : "border-transparent bg-white/10 text-white/70 hover:border-white hover:bg-red-900/40 hover:text-white"
+                  }`}
+                >
+                  {deletingTheme ? "Suppression…" : "Supprimer la musique"}
+                </button>
+              ) : null}
             </div>
           </div>
         </div>

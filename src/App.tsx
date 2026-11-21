@@ -89,6 +89,9 @@ function App() {
   const lastTileIndex = tiles.length - 1;
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Verrou synchrone du lancement : `busy` n'est pas encore visible pour un
+  // second appel qui arrive dans le même tick (clavier + clic + manette).
+  const launchInFlightRef = useRef(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [bootPhase, setBootPhase] = useState<BootPhase>("running");
@@ -96,7 +99,13 @@ function App() {
   const [addOpen, setAddOpen] = useState(false);
 
   useEffect(() => {
-    invoke<Game[]>("get_games")
+    // Purge d'abord les musiques dont la provenance n'est plus conforme ; les
+    // fichiers absents sont oubliés. Aucun accès réseau à cette étape.
+    invoke<Game[]>("revalidate_game_themes")
+      .catch((cause) => {
+        console.warn("[thèmes] revalidation impossible:", cause);
+        return invoke<Game[]>("get_games");
+      })
       .then(setGames)
       .catch((cause) => setError(String(cause)));
   }, []);
@@ -272,9 +281,10 @@ function App() {
 
   /** Lance un jeu précis (ruban ou Bibliothèque) et repose le focus dessus. */
   async function launchGame(gameId: string) {
-    if (busy) return;
+    if (busy || launchInFlightRef.current) return;
     // Le son de démarrage et la coupure de la musique sont joués par Ps4Home,
     // avec l'écran de démarrage, 1,8 s avant cet appel.
+    launchInFlightRef.current = true;
     setBusy(true);
     try {
       setGames(await invoke<Game[]>("launch_game", { id: gameId }));
@@ -285,7 +295,10 @@ function App() {
       playError();
       setError(String(cause));
       resumeBgm();
+      // Le splash attend le lancement : une erreur doit le refermer tout de suite.
+      throw cause;
     } finally {
+      launchInFlightRef.current = false;
       setBusy(false);
     }
   }
@@ -416,7 +429,7 @@ function App() {
           allGames={games}
           addOpen={addOpen}
           onTogglePin={toggleGamePin}
-          onLaunchGame={(gameId) => void launchGame(gameId)}
+          onLaunchGame={(gameId) => launchGame(gameId)}
           onRequestDelete={requestDelete}
           onConfirmDelete={deleteSelected}
           onCancelDelete={() => setPendingDeleteId(null)}

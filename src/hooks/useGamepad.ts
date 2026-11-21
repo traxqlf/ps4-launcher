@@ -78,10 +78,27 @@ export interface GamepadOptions {
 }
 
 let globalInputLocked = false;
+let gamepadSuspended = false;
 
 /** Bloque les hooks globaux pendant qu'une zone locale navigue. */
 export function setGlobalGamepadLock(locked: boolean) {
   globalInputLocked = locked;
+}
+
+// Une session de jeu arrête complètement le polling : plus aucune boucle
+// requestAnimationFrame ne tourne tant que le launcher est en arrière-plan.
+const suspensionListeners = new Set<(suspended: boolean) => void>();
+
+/** Suspend (ou relance) la boucle manette pendant une session de jeu. */
+export function setGamepadSuspended(suspended: boolean) {
+  if (gamepadSuspended === suspended) return;
+  gamepadSuspended = suspended;
+  for (const listener of suspensionListeners) listener(suspended);
+}
+
+/** Vrai pendant une session de jeu : aucune entrée du launcher n'est lue. */
+export function isGamepadSuspended(): boolean {
+  return gamepadSuspended;
 }
 
 /**
@@ -190,6 +207,7 @@ export function useGamepad(
 
   useEffect(() => {
     let frame = 0;
+    let animating = false;
     let lastNav = 0;
     let confirmHeld = false;
     let backHeld = false;
@@ -267,6 +285,12 @@ export function useGamepad(
     };
 
     const tick = (now: number) => {
+      // Jeu en cours : la boucle s'arrête net au lieu de continuer à vide.
+      if (gamepadSuspended) {
+        animating = false;
+        frame = 0;
+        return;
+      }
       frame = requestAnimationFrame(tick);
 
       // Zone locale active : on garde les fronts à jour pour qu'un bouton
@@ -335,9 +359,33 @@ export function useGamepad(
       r2Held = r2;
     };
 
-    frame = requestAnimationFrame(tick);
+    const startLoop = () => {
+      if (animating || gamepadSuspended) return;
+      animating = true;
+      frame = requestAnimationFrame(tick);
+    };
+
+    const stopLoop = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = 0;
+      animating = false;
+    };
+
+    const onSuspended = (suspended: boolean) => {
+      if (suspended) {
+        heldKeys.clear();
+        stopLoop();
+      } else {
+        lastNav = 0;
+        startLoop();
+      }
+    };
+
+    suspensionListeners.add(onSuspended);
+    startLoop();
 
     const onKeyDown = (event: KeyboardEvent) => {
+      if (gamepadSuspended) return;
       if (hasSystemModifier(event)) return;
       if (suspendable && globalInputLocked) return;
 
@@ -400,7 +448,8 @@ export function useGamepad(
     window.addEventListener("blur", onBlur);
 
     return () => {
-      cancelAnimationFrame(frame);
+      suspensionListeners.delete(onSuspended);
+      stopLoop();
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);

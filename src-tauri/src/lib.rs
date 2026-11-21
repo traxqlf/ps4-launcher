@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
 use uuid::Uuid;
 
@@ -97,7 +98,8 @@ fn games_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir indisponible: {e}"))?;
-    fs::create_dir_all(&dir).map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
     Ok(dir.join("games.json"))
 }
 
@@ -125,7 +127,8 @@ fn profile_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir indisponible: {e}"))?;
-    fs::create_dir_all(&dir).map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
     Ok(dir.join("profile.json"))
 }
 
@@ -546,7 +549,8 @@ fn covers_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("app_data_dir indisponible: {e}"))?
         .join(COVERS_DIR);
-    fs::create_dir_all(&dir).map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
     Ok(dir)
 }
 
@@ -580,7 +584,8 @@ fn icons_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("app_data_dir indisponible: {e}"))?
         .join(ICONS_DIR);
-    fs::create_dir_all(&dir).map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
     Ok(dir)
 }
 
@@ -666,12 +671,7 @@ async fn steamgriddb_hero_url(
     let url = format!(
         "{STEAMGRIDDB_API}/heroes/steam/{appid}?dimensions=3840x1240,1920x620&types=static&nsfw=false&humor=false"
     );
-    let response = client
-        .get(&url)
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .ok()?;
+    let response = client.get(&url).bearer_auth(api_key).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -746,12 +746,7 @@ async fn sgdb_square_cover_by_id(
     let url = format!(
         "{STEAMGRIDDB_API}/grids/{path}?dimensions=1024x1024,512x512&types=static&nsfw=false&humor=false"
     );
-    let response = client
-        .get(&url)
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .ok()?;
+    let response = client.get(&url).bearer_auth(api_key).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -811,14 +806,327 @@ fn launch_executable(
     title: &str,
     args: &[String],
 ) -> Result<std::process::Child, String> {
+    use std::os::windows::process::CommandExt;
+
+    // CREATE_NEW_PROCESS_GROUP : le jeu ne partage pas le groupe de processus
+    // du launcher et peut être détaché proprement, comme un jeu non-Steam.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
     let parent = exe
         .parent()
         .ok_or_else(|| format!("dossier parent introuvable pour {}", exe.display()))?;
     std::process::Command::new(exe)
         .current_dir(parent)
         .args(args)
+        // Aucun descripteur bloquant hérité : les sorties du jeu ne retiennent
+        // ni le launcher ni un pipe ouvert.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .map_err(|e| format!("lancement de {title} impossible: {e}"))
+}
+
+/* ────────────── Fenêtre du jeu : attente de la première image ────────────── */
+
+/// Payload de disponibilité du jeu : le splash peut rendre la main.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameWindowReady {
+    game_id: String,
+}
+
+#[cfg(target_os = "windows")]
+mod game_window {
+    use super::{GameWindowReady, path_is_inside};
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    use tauri::{Emitter, Manager};
+    use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPARAM, TRUE};
+    use winapi::shared::windef::{HWND, RECT};
+    use winapi::um::dwmapi::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::{GetCurrentProcessId, OpenProcess};
+    use winapi::um::winbase::QueryFullProcessImageNameW;
+    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+    use winapi::um::winuser::{
+        EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SW_RESTORE,
+        SetForegroundWindow, ShowWindow,
+    };
+
+    /// Attente maximale de l'apparition de la fenêtre du jeu.
+    const TIMEOUT: Duration = Duration::from_secs(45);
+    /// Fréquence d'énumération des fenêtres de premier niveau.
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    /// Délai après création : DirectX / Vulkan présente sa première image.
+    const FRAME_DELAY: Duration = Duration::from_millis(400);
+    /// Taille minimale : ignore les popups Steam et les overlays d'anticheat.
+    const MIN_WIDTH: i32 = 640;
+    const MIN_HEIGHT: i32 = 480;
+
+    /// Fenêtres visibles avant le lancement, hors launcher : toute nouvelle
+    /// fenêtre absente de cet ensemble est candidate.
+    pub(super) fn snapshot() -> HashSet<isize> {
+        unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let windows = unsafe { &mut *(lparam as *mut HashSet<isize>) };
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+            if pid != 0
+                && pid != unsafe { GetCurrentProcessId() }
+                && unsafe { IsWindowVisible(hwnd) } != 0
+            {
+                windows.insert(hwnd as isize);
+            }
+            TRUE
+        }
+
+        let mut windows = HashSet::new();
+        unsafe {
+            EnumWindows(Some(collect), &mut windows as *mut _ as LPARAM);
+        }
+        windows
+    }
+
+    /// Ramène au premier plan la première fenêtre visible du processus.
+    /// Retourne `false` si le processus n'a pas encore de fenêtre.
+    pub(super) fn focus_pid(target_pid: u32) -> bool {
+        struct Search {
+            target_pid: u32,
+            hwnd: Option<HWND>,
+        }
+
+        unsafe extern "system" fn inspect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let search = unsafe { &mut *(lparam as *mut Search) };
+            if search.hwnd.is_some() {
+                return FALSE;
+            }
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+            if pid != search.target_pid || unsafe { IsWindowVisible(hwnd) } == 0 {
+                return TRUE;
+            }
+            search.hwnd = Some(hwnd);
+            FALSE
+        }
+
+        let mut search = Search {
+            target_pid,
+            hwnd: None,
+        };
+        unsafe {
+            EnumWindows(Some(inspect), &mut search as *mut _ as LPARAM);
+        }
+        let Some(hwnd) = search.hwnd else {
+            return false;
+        };
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+        true
+    }
+
+    /// Chemin de l'exécutable propriétaire d'un processus, si accessible.
+    fn process_path(pid: u32) -> Option<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+        if process.is_null() {
+            return None;
+        }
+        let mut buffer = [0u16; 1024];
+        let mut size = buffer.len() as DWORD;
+        let read =
+            unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut size) };
+        unsafe { CloseHandle(process) };
+        if read == 0 || size == 0 {
+            return None;
+        }
+        Some(PathBuf::from(std::ffi::OsString::from_wide(
+            &buffer[..size as usize],
+        )))
+    }
+
+    /// Nouvelle fenêtre du jeu : priorité au processus installé dans le dossier
+    /// du jeu, sinon la première grande fenêtre apparue depuis le snapshot.
+    fn find(snapshot: &HashSet<isize>, game_root: &Path) -> Option<HWND> {
+        struct Search<'a> {
+            snapshot: &'a HashSet<isize>,
+            game_root: &'a Path,
+            fallback: Option<HWND>,
+            priority: Option<HWND>,
+        }
+
+        unsafe extern "system" fn inspect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let search = unsafe { &mut *(lparam as *mut Search<'_>) };
+            if search.priority.is_some() {
+                return FALSE;
+            }
+            if search.snapshot.contains(&(hwnd as isize)) {
+                return TRUE;
+            }
+            if unsafe { IsWindowVisible(hwnd) } == 0 {
+                return TRUE;
+            }
+
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+            if pid == 0 || pid == unsafe { GetCurrentProcessId() } {
+                return TRUE;
+            }
+
+            let mut cloaked = 0u32;
+            let cloaked_result = unsafe {
+                DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAKED as DWORD,
+                    &mut cloaked as *mut u32 as *mut _,
+                    std::mem::size_of::<u32>() as DWORD,
+                )
+            };
+            if cloaked_result == 0 && cloaked != 0 {
+                return TRUE;
+            }
+
+            let mut rect: RECT = unsafe { std::mem::zeroed() };
+            if unsafe { GetWindowRect(hwnd, &mut rect) } == 0
+                || rect.right - rect.left < MIN_WIDTH
+                || rect.bottom - rect.top < MIN_HEIGHT
+            {
+                return TRUE;
+            }
+
+            if process_path(pid).is_some_and(|path| path_is_inside(&path, search.game_root)) {
+                search.priority = Some(hwnd);
+                return FALSE;
+            }
+            if search.fallback.is_none() {
+                search.fallback = Some(hwnd);
+            }
+            TRUE
+        }
+
+        let mut search = Search {
+            snapshot,
+            game_root,
+            fallback: None,
+            priority: None,
+        };
+        unsafe {
+            EnumWindows(Some(inspect), &mut search as *mut _ as LPARAM);
+        }
+        search.priority.or(search.fallback)
+    }
+
+    /// Range le launcher derrière le jeu et retire le premier plan forcé.
+    fn dismiss_launcher(app: &tauri::AppHandle) {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.set_always_on_top(false);
+            let _ = window.minimize();
+        }
+    }
+
+    /// Attend la fenêtre du jeu puis lui donne le premier plan. Le polling
+    /// s'arrête dès la fenêtre trouvée, au timeout ou à la fin de la session.
+    pub(super) fn watch(
+        app: tauri::AppHandle,
+        game_root: PathBuf,
+        game_id: String,
+        snapshot: HashSet<isize>,
+        stop: Arc<AtomicBool>,
+    ) {
+        let deadline = Instant::now() + TIMEOUT;
+        let hwnd = loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Some(hwnd) = find(&snapshot, &game_root) {
+                break hwnd;
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "[jeu] fenêtre de {game_id} introuvable après {} s",
+                    TIMEOUT.as_secs()
+                );
+                // Le splash se referme de lui-même après 45 s : rendre la main
+                // à l'accueil plutôt que de révéler le bureau.
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_always_on_top(false);
+                }
+                return;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        };
+
+        // Le jeu vient de créer sa fenêtre : laisser le moteur graphique
+        // présenter sa première image avant de retirer le splash.
+        std::thread::sleep(FRAME_DELAY);
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+        dismiss_launcher(&app);
+        if let Err(error) = app.emit("game-window-ready", GameWindowReady { game_id }) {
+            eprintln!("[jeu] émission de game-window-ready impossible: {error}");
+        }
+    }
+}
+
+/// Détection d'un processus déjà actif par son nom d'exécutable.
+/// Win32 uniquement : permet de ne jamais démarrer un second `Game.exe`.
+#[cfg(target_os = "windows")]
+mod process_guard {
+    use std::path::Path;
+    use winapi::shared::minwindef::FALSE;
+    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    /// PID du premier processus dont le nom correspond, hors launcher.
+    pub(super) fn find_pid(exe: &Path) -> Option<u32> {
+        let target = exe.file_name()?.to_string_lossy().to_string();
+        if target.is_empty() {
+            return None;
+        }
+
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                eprintln!("[jeu] snapshot des processus indisponible");
+                return None;
+            }
+
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut current = Process32FirstW(snapshot, &mut entry);
+            let mut found = None;
+            while current != FALSE {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|character| *character == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                if entry.th32ProcessID != std::process::id() && name.eq_ignore_ascii_case(&target) {
+                    found = Some(entry.th32ProcessID);
+                    break;
+                }
+                current = Process32NextW(snapshot, &mut entry);
+            }
+            CloseHandle(snapshot);
+            found
+        }
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -832,6 +1140,10 @@ const PROCESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 /// complet (minimisation, événement de fin, restauration) sans exécutable.
 #[cfg(not(target_os = "windows"))]
 const SIMULATED_SESSION_SECONDS: u64 = 5;
+
+/// Fenêtre simulée du jeu hors Windows : le splash se ferme au bout de 3 s.
+#[cfg(not(target_os = "windows"))]
+const SIMULATED_WINDOW_SECONDS: u64 = 3;
 
 /// Dossiers d'exécutables à dépasser pour retrouver la racine du jeu.
 #[cfg(any(target_os = "windows", test))]
@@ -895,6 +1207,10 @@ fn path_is_inside(candidate: &Path, root: &Path) -> bool {
 /// code de sortie non nul.
 const CRASH_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Un seul lancement de jeu à la fois, pendant toute la session : les appels
+/// concurrents (clavier, clic, manette) sont rejetés avant tout `Command::new`.
+static GAME_LAUNCH_LOCK: AtomicBool = AtomicBool::new(false);
+
 /// Attend la fin de tous les processus du jeu (le lanceur peut céder la main)
 /// et renvoie la durée exacte de la session ainsi que le code de sortie du
 /// processus lancé.
@@ -954,7 +1270,10 @@ fn finish_game_session(
     elapsed: std::time::Duration,
     exit_code: Option<i32>,
 ) {
+    // La session est réellement terminée : un nouveau lancement est autorisé.
+    GAME_LAUNCH_LOCK.store(false, Ordering::SeqCst);
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_always_on_top(false);
         let _ = window.unminimize();
         let _ = window.set_focus();
         let _ = window.set_fullscreen(true);
@@ -1005,16 +1324,37 @@ fn run_game_session(
     started: std::time::Instant,
 ) -> Result<(), String> {
     let game_root = game_root_dir(&exe);
+    // Snapshot avant le lancement : seules les fenêtres apparues ensuite
+    // peuvent être celle du jeu.
+    let snapshot = game_window::snapshot();
     let mut child = launch_executable(&exe, &title, &args)?;
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher_app = app.clone();
+    let watcher_root = game_root.clone();
+    let watcher_game = game_id.clone();
+    let watcher_stop = stop.clone();
+    std::thread::spawn(move || {
+        game_window::watch(
+            watcher_app,
+            watcher_root,
+            watcher_game,
+            snapshot,
+            watcher_stop,
+        );
+    });
+
     std::thread::spawn(move || {
         // Le lanceur rend souvent la main avant le vrai jeu : on attend sa
         // sortie, puis on surveille les processus de la racine du jeu.
         let exit_code = child.wait().ok().and_then(|status| status.code());
         let exited_after = started.elapsed();
-        let fast_failure = exited_after < CRASH_WINDOW
-            && exit_code.is_some_and(|code| code != 0);
+        let fast_failure = exited_after < CRASH_WINDOW && exit_code.is_some_and(|code| code != 0);
         let (elapsed, exit_code) =
             monitor_game_processes(&game_root, started, exit_code, fast_failure);
+        // La session est finie : la surveillance de fenêtre ne doit plus
+        // masquer le retour au launcher.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         finish_game_session(&app, &game_id, elapsed, exit_code);
     });
     Ok(())
@@ -1033,7 +1373,19 @@ fn run_game_session(
 ) -> Result<(), String> {
     launch_executable(&exe, &title, &args)?;
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(SIMULATED_SESSION_SECONDS));
+        // Fenêtre simulée : le splash se ferme après 3 s, comme un vrai jeu.
+        std::thread::sleep(std::time::Duration::from_secs(SIMULATED_WINDOW_SECONDS));
+        if let Err(error) = app.emit(
+            "game-window-ready",
+            GameWindowReady {
+                game_id: game_id.clone(),
+            },
+        ) {
+            eprintln!("[jeu] émission de game-window-ready impossible: {error}");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(
+            SIMULATED_SESSION_SECONDS.saturating_sub(SIMULATED_WINDOW_SECONDS),
+        ));
         finish_game_session(&app, &game_id, started.elapsed(), None);
     });
     Ok(())
@@ -1098,7 +1450,7 @@ fn quit_app(app: tauri::AppHandle) {
 
 const THEMES_DIR: &str = "themes";
 const YTDLP_DIR: &str = "bin";
-const THEME_EXTENSIONS: [&str; 3] = ["m4a", "webm", "mp3"];
+const THEME_EXTENSIONS: [&str; 6] = ["m4a", "webm", "mp3", "opus", "ogg", "aac"];
 
 fn themes_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
@@ -1106,7 +1458,8 @@ fn themes_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("app_data_dir indisponible: {e}"))?
         .join(THEMES_DIR);
-    fs::create_dir_all(&dir).map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
     Ok(dir)
 }
 
@@ -1133,6 +1486,420 @@ fn existing_theme(themes: &Path, game_id: &str) -> Option<PathBuf> {
         .iter()
         .map(|ext| themes.join(format!("{game_id}.{ext}")))
         .find(|path| path.is_file())
+}
+
+/* ── Correspondance stricte des bandes-son ── */
+
+/// Incrémenté à chaque durcissement des règles : un cache dont la provenance
+/// n'a pas été validée par cette version est purgé, jamais rejoué.
+const THEME_VALIDATION_VERSION: u32 = 2;
+const THEME_MIN_DURATION: f64 = 30.0;
+const THEME_MAX_DURATION: f64 = 600.0;
+const THEME_MIN_CONFIDENCE: u32 = 75;
+const THEME_SEARCH_RESULTS: usize = 10;
+const THEME_MIN_FILE_BYTES: u64 = 64 * 1024;
+
+/// Pause demandée par le front (jeu en cours, fenêtre masquée, lancement).
+static THEME_FETCH_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static THEME_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[tauri::command]
+fn cancel_theme_fetch() {
+    THEME_FETCH_ENABLED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn resume_theme_fetch() {
+    THEME_FETCH_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn theme_fetch_cancelled() -> bool {
+    !THEME_FETCH_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Provenance du fichier audio : sans elle, impossible de re-vérifier qu'une
+/// musique mise en cache correspond encore réellement au jeu.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ThemeMetadata {
+    version: u32,
+    game_title: String,
+    match_title: String,
+    channel: String,
+    video_id: String,
+    source_url: String,
+    duration: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ThemeCandidate {
+    video_id: String,
+    title: String,
+    channel: String,
+    duration: Option<f64>,
+    source_url: String,
+    score: u32,
+}
+
+fn theme_metadata_path(themes: &Path, game_id: &str) -> PathBuf {
+    themes.join(format!("{game_id}.json"))
+}
+
+fn read_theme_metadata(themes: &Path, game_id: &str) -> Option<ThemeMetadata> {
+    let bytes = fs::read(theme_metadata_path(themes, game_id)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_theme_metadata(
+    themes: &Path,
+    game_id: &str,
+    metadata: &ThemeMetadata,
+) -> Result<(), String> {
+    let path = theme_metadata_path(themes, game_id);
+    let temp = themes.join(format!("{game_id}.json.tmp"));
+    let bytes = serde_json::to_vec_pretty(metadata)
+        .map_err(|error| format!("métadonnées du thème illisibles: {error}"))?;
+    fs::write(&temp, bytes)
+        .map_err(|error| format!("écriture de {} impossible: {error}", temp.display()))?;
+    // Windows refuse le renommage par-dessus un fichier existant.
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    fs::rename(&temp, &path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("installation de {} impossible: {error}", path.display())
+    })
+}
+
+/// Supprime le fichier audio, ses parties interrompues et le sidecar JSON.
+fn remove_theme_artifacts(themes: &Path, game_id: &str) {
+    let prefix = format!("{game_id}.");
+    let Ok(entries) = fs::read_dir(themes) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name == game_id || name.starts_with(&prefix) {
+            if let Err(error) = fs::remove_file(&path) {
+                eprintln!(
+                    "[thème] suppression de {} impossible: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+fn cached_theme_is_valid(themes: &Path, game_id: &str, game_title: &str) -> bool {
+    let Some(audio) = existing_theme(themes, game_id) else {
+        return false;
+    };
+    let size = fs::metadata(&audio).map(|meta| meta.len()).unwrap_or(0);
+    if size < THEME_MIN_FILE_BYTES {
+        return false;
+    }
+    let Some(metadata) = read_theme_metadata(themes, game_id) else {
+        return false;
+    };
+    metadata.version == THEME_VALIDATION_VERSION
+        && validate_theme_candidate(
+            game_title,
+            &metadata.match_title,
+            &metadata.channel,
+            metadata.duration,
+        )
+        .is_some()
+}
+
+/// Minuscules, accents repliés, ponctuation retirée. Le contenu entre
+/// parenthèses est conservé : « DOOM (2016) » ne doit pas devenir « DOOM ».
+fn normalize_theme_text(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for character in raw.chars() {
+        // Les apostrophes sont supprimées sans espace : « Assassin's » et
+        // « Assassins » doivent produire la même clé de comparaison.
+        if matches!(character, '\'' | '\u{2019}' | '\u{02BC}' | '`') {
+            continue;
+        }
+        let folded = fold_latin(character.to_lowercase().next().unwrap_or(character));
+        if folded.is_alphanumeric() {
+            if pending_space && !output.is_empty() {
+                output.push(' ');
+            }
+            output.push(folded);
+            pending_space = false;
+        } else {
+            pending_space = true;
+        }
+    }
+    output
+}
+
+/// Repli ASCII des accents latins courants : « Ragnarök » et « Ragnarok »
+/// doivent produire le même titre comparable.
+fn fold_latin(character: char) -> char {
+    match character {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+        'ç' | 'ć' | 'č' => 'c',
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ė' | 'ę' => 'e',
+        'ì' | 'í' | 'î' | 'ï' | 'ī' | 'į' => 'i',
+        'ñ' | 'ń' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' | 'ų' => 'u',
+        'ý' | 'ÿ' => 'y',
+        'ß' => 's',
+        'æ' => 'a',
+        'œ' => 'o',
+        _ => character,
+    }
+}
+
+fn squash_spaces(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Éditions commerciales retirées du titre du jeu : « GOTY », « Definitive
+/// Edition », etc. ne doivent pas empêcher de reconnaître la bande-son.
+const THEME_EDITION_SUFFIXES: [&str; 14] = [
+    "game of the year edition",
+    "game of the year",
+    "goty edition",
+    "goty",
+    "definitive edition",
+    "complete edition",
+    "deluxe edition",
+    "ultimate edition",
+    "enhanced edition",
+    "special edition",
+    "collector s edition",
+    "gold edition",
+    "anniversary edition",
+    "legendary edition",
+];
+
+fn strip_editions(normalized: &str) -> String {
+    let mut text = format!(" {normalized} ");
+    loop {
+        let mut changed = false;
+        for suffix in THEME_EDITION_SUFFIXES {
+            let needle = format!(" {suffix} ");
+            if text.contains(&needle) {
+                text = text.replace(&needle, " ");
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    squash_spaces(&text)
+}
+
+/// Résultats sans rapport avec une bande-son officielle.
+const BLOCKED_TERMS: [&str; 20] = [
+    "cover",
+    "remix",
+    "nightcore",
+    "8 bit",
+    "8bit",
+    "piano",
+    "gameplay",
+    "review",
+    "trailer",
+    "reaction",
+    "karaoke",
+    "parody",
+    "fan made",
+    "fanmade",
+    "mashup",
+    "medley",
+    "slowed",
+    "reverb",
+    "bass boosted",
+    "type beat",
+];
+
+fn has_blocked_term(normalized: &str) -> bool {
+    if normalized.is_empty() {
+        return false;
+    }
+    let padded = format!(" {normalized} ");
+    BLOCKED_TERMS
+        .iter()
+        .any(|term| padded.contains(&format!(" {term} ")))
+}
+
+/// Marqueurs acceptés, du plus spécifique au plus générique. « theme » seul
+/// n'est volontairement pas accepté : trop souvent utilisé par des reprises.
+const OFFICIAL_MARKERS: [&[&str]; 9] = [
+    &["original", "soundtrack"],
+    &["official", "soundtrack"],
+    &["original", "game", "soundtrack"],
+    &["soundtrack"],
+    &["ost"],
+    &["main", "menu", "theme"],
+    &["main", "theme"],
+    &["theme", "music"],
+    &["title", "theme"],
+];
+
+const SUBJECT_FILLERS: [&str; 15] = [
+    "official",
+    "video",
+    "audio",
+    "ps4",
+    "ps5",
+    "playstation",
+    "pc",
+    "steam",
+    "hd",
+    "4k",
+    "hq",
+    "full",
+    "album",
+    "version",
+    "edition",
+];
+
+fn find_official_marker(tokens: &[String]) -> Option<(usize, &'static [&'static str])> {
+    let mut best: Option<(usize, usize, &'static [&'static str])> = None;
+    for index in 0..tokens.len() {
+        for marker in OFFICIAL_MARKERS.iter().copied() {
+            if index + marker.len() > tokens.len() {
+                continue;
+            }
+            let matches = marker
+                .iter()
+                .zip(&tokens[index..])
+                .all(|(needle, token)| token.as_str() == *needle);
+            if !matches {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((best_index, best_len, _)) => {
+                    index < best_index || (index == best_index && marker.len() > best_len)
+                }
+            };
+            if better {
+                best = Some((index, marker.len(), marker));
+            }
+        }
+    }
+    best.map(|(index, _, marker)| (index, marker))
+}
+
+/// Seuil élevé obligatoire : titre exact (éditions retirées), marqueur officiel,
+/// aucun mot-clé parasite, durée plausible. Le score départage les sources.
+fn validate_theme_candidate(
+    game_title: &str,
+    candidate_title: &str,
+    channel: &str,
+    duration: Option<f64>,
+) -> Option<u32> {
+    let game_base = strip_editions(&normalize_theme_text(game_title));
+    if game_base.is_empty() {
+        return None;
+    }
+
+    let title = normalize_theme_text(candidate_title);
+    let channel_normalized = normalize_theme_text(channel);
+    if title.is_empty() || has_blocked_term(&title) || has_blocked_term(&channel_normalized) {
+        return None;
+    }
+
+    let duration = duration?;
+    if !(THEME_MIN_DURATION..=THEME_MAX_DURATION).contains(&duration) {
+        return None;
+    }
+
+    let tokens: Vec<String> = title.split_whitespace().map(str::to_string).collect();
+    let (marker_index, marker) = find_official_marker(&tokens)?;
+    let subject = tokens[..marker_index]
+        .iter()
+        .map(String::as_str)
+        .filter(|token| !SUBJECT_FILLERS.contains(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Correspondance stricte : ni titre partiel, ni suffixe supplémentaire
+    // (DOOM ne doit pas accepter DOOM Eternal, et inversement).
+    if subject.is_empty() || subject != game_base {
+        return None;
+    }
+
+    let mut score = 60;
+    if marker
+        .iter()
+        .any(|token| *token == "soundtrack" || *token == "ost")
+    {
+        score += 10;
+    }
+    if title.split_whitespace().any(|token| token == "official") {
+        score += 5;
+    }
+    if channel_normalized.split_whitespace().any(|token| {
+        matches!(
+            token,
+            "soundtrack" | "ost" | "official" | "records" | "topic" | "music"
+        )
+    }) {
+        score += 15;
+    }
+    if (60.0..=420.0).contains(&duration) {
+        score += 5;
+    }
+
+    Some(score)
+}
+
+fn pick_best_theme(
+    game_title: &str,
+    candidates: &[ThemeCandidate],
+) -> Result<ThemeCandidate, &'static str> {
+    let mut scored: Vec<ThemeCandidate> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            validate_theme_candidate(
+                game_title,
+                &candidate.title,
+                &candidate.channel,
+                candidate.duration,
+            )
+            .map(|score| ThemeCandidate {
+                score,
+                ..candidate.clone()
+            })
+        })
+        .collect();
+
+    scored.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.video_id.cmp(&right.video_id))
+    });
+
+    let best = scored
+        .first()
+        .ok_or("aucun résultat ne correspond exactement au titre du jeu")?;
+    if best.score < THEME_MIN_CONFIDENCE {
+        return Err("score de confiance insuffisant");
+    }
+    if scored
+        .get(1)
+        .is_some_and(|second| best.score.saturating_sub(second.score) < 10)
+    {
+        return Err("correspondance ambiguë entre plusieurs résultats");
+    }
+    Ok(best.clone())
 }
 
 #[cfg(target_os = "windows")]
@@ -1171,7 +1938,8 @@ async fn ensure_yt_dlp(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("app_data_dir indisponible: {e}"))?
         .join(YTDLP_DIR);
-    fs::create_dir_all(&dir).map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
     let target = dir.join(yt_dlp_name());
 
     let url = if cfg!(target_os = "windows") {
@@ -1188,7 +1956,7 @@ async fn ensure_yt_dlp(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .build()
         .map_err(|e| format!("client HTTP indisponible: {e}"))?;
 
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .await
@@ -1196,10 +1964,26 @@ async fn ensure_yt_dlp(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     if !response.status().is_success() {
         return Err(format!("yt-dlp: HTTP {}", response.status()));
     }
-    let bytes = response
-        .bytes()
+    // Lecture par blocs : une pause demandée pendant l'installation coupe le
+    // réseau au lieu d'attendre la fin du téléchargement complet.
+    const MAX_YT_DLP_BYTES: usize = 256 * 1024 * 1024;
+    let mut bytes = Vec::with_capacity(4 * 1024 * 1024);
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| format!("lecture de yt-dlp impossible: {e}"))?;
+        .map_err(|e| format!("lecture de yt-dlp impossible: {e}"))?
+    {
+        if theme_fetch_cancelled() {
+            return Err("thème: téléchargement annulé".to_string());
+        }
+        if bytes.len().saturating_add(chunk.len()) > MAX_YT_DLP_BYTES {
+            return Err("yt-dlp: téléchargement anormalement volumineux".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if theme_fetch_cancelled() {
+        return Err("thème: téléchargement annulé".to_string());
+    }
 
     // Téléchargement dans un fichier temporaire, puis renommage atomique : un
     // binaire tronqué (réseau coupé) ne remplace jamais une installation saine.
@@ -1250,48 +2034,243 @@ async fn ensure_yt_dlp(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-/// Cherche et télécharge une piste audio : première requête, puis repli.
-fn run_yt_dlp(
-    binary: &Path,
-    themes: &Path,
-    game_id: &str,
-    query: &str,
-) -> Result<(), String> {
-    let output_path = themes.join(format!("{game_id}.%(ext)s"));
-    let mut command = std::process::Command::new(binary);
-    command
-        .arg("--no-playlist")
-        .arg("--match-filter")
-        .arg("duration < 600")
-        .arg("-f")
-        .arg("bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio")
-        .arg("-o")
-        .arg(&output_path)
-        .arg(format!("ytsearch1:{query}"));
-
-    // Sous Windows, pas de fenêtre de console qui clignote par-dessus le jeu.
+// Sous Windows, pas de fenêtre de console qui clignote par-dessus le jeu.
+fn hide_process_window(command: &mut std::process::Command) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = command;
+    }
+}
 
-    let output = command
-        .output()
-        .map_err(|e| format!("exécution de yt-dlp impossible: {e}"))?;
+/// Exécute yt-dlp sans pipe bloquant (sorties dans des fichiers temporaires),
+/// avec un contrôle de pause toutes les 100 ms : un jeu qui démarre tue
+/// immédiatement le téléchargement au lieu de le laisser tourner en fond.
+fn run_theme_command(mut command: std::process::Command) -> Result<std::process::Output, String> {
+    if theme_fetch_cancelled() {
+        return Err("thème: téléchargement annulé".to_string());
+    }
+
+    let serial = THEME_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!(
+        "ps4-launcher-theme-{}-{serial}",
+        std::process::id()
+    ));
+    let stdout_path = base.with_extension("out");
+    let stderr_path = base.with_extension("err");
+    let cleanup = || {
+        let _ = fs::remove_file(&stdout_path);
+        let _ = fs::remove_file(&stderr_path);
+    };
+
+    let stdout = match fs::File::create(&stdout_path) {
+        Ok(file) => file,
+        Err(error) => {
+            cleanup();
+            return Err(format!("fichier temporaire stdout impossible: {error}"));
+        }
+    };
+    let stderr = match fs::File::create(&stderr_path) {
+        Ok(file) => file,
+        Err(error) => {
+            cleanup();
+            return Err(format!("fichier temporaire stderr impossible: {error}"));
+        }
+    };
+    command.stdout(stdout).stderr(stderr);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup();
+            return Err(format!("exécution de yt-dlp impossible: {error}"));
+        }
+    };
+
+    let status = loop {
+        if theme_fetch_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup();
+            return Err("thème: téléchargement annulé".to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                cleanup();
+                return Err(format!("attente de yt-dlp impossible: {error}"));
+            }
+        }
+    };
+
+    let stdout = fs::read(&stdout_path).unwrap_or_default();
+    let stderr = fs::read(&stderr_path).unwrap_or_default();
+    cleanup();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct YtDlpEntry {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    uploader: Option<String>,
+    #[serde(default)]
+    duration: Option<f64>,
+    #[serde(default)]
+    live_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YtDlpSearch {
+    entries: Option<Vec<YtDlpEntry>>,
+}
+
+fn merge_candidates(target: &mut Vec<ThemeCandidate>, incoming: Vec<ThemeCandidate>) {
+    for candidate in incoming {
+        if !target
+            .iter()
+            .any(|existing| existing.video_id == candidate.video_id)
+        {
+            target.push(candidate);
+        }
+    }
+}
+
+/// Recherche large (10 résultats) mais aucune sélection ici : tous les
+/// candidats sont renvoyés au validateur strict.
+fn search_theme_candidates(binary: &Path, query: &str) -> Result<Vec<ThemeCandidate>, String> {
+    let mut command = std::process::Command::new(binary);
+    command
+        .arg("--no-playlist")
+        .arg("--flat-playlist")
+        .arg("--dump-single-json")
+        .arg("--no-warnings")
+        .arg("--socket-timeout")
+        .arg("20")
+        .arg(format!("ytsearch{THEME_SEARCH_RESULTS}:{query}"));
+    hide_process_window(&mut command);
+
+    let output = run_theme_command(command)?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(400)
+            .collect::<String>();
         return Err(if stderr.is_empty() {
-            format!("yt-dlp a échoué ({})", output.status)
+            format!("recherche yt-dlp échouée ({})", output.status)
         } else {
             stderr
         });
     }
-    Ok(())
+
+    let parsed: YtDlpSearch = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("réponse yt-dlp illisible: {error}"))?;
+
+    let mut candidates = Vec::new();
+    for entry in parsed.entries.unwrap_or_default() {
+        let Some(id) = entry.id.filter(|id| !id.trim().is_empty()) else {
+            continue;
+        };
+        let Some(title) = entry.title else {
+            continue;
+        };
+        if entry
+            .live_status
+            .as_deref()
+            .is_some_and(|status| status != "not_live")
+        {
+            continue;
+        }
+        let channel = entry.channel.or(entry.uploader).unwrap_or_default();
+        candidates.push(ThemeCandidate {
+            source_url: format!("https://www.youtube.com/watch?v={id}"),
+            video_id: id,
+            title,
+            channel,
+            duration: entry.duration,
+            score: 0,
+        });
+    }
+    Ok(candidates)
 }
 
-/// Musique de thème d'un jeu : fichier déjà présent, sinon recherche YouTube
-/// automatique. Renvoie le chemin absolu du fichier audio.
+fn download_theme(
+    binary: &Path,
+    themes: &Path,
+    game_id: &str,
+    candidate: &ThemeCandidate,
+) -> Result<PathBuf, String> {
+    remove_theme_artifacts(themes, game_id);
+    let output_path = themes.join(format!("{game_id}.%(ext)s"));
+    let mut command = std::process::Command::new(binary);
+    command
+        .arg("--no-playlist")
+        .arg("--no-warnings")
+        .arg("--no-progress")
+        .arg("--socket-timeout")
+        .arg("20")
+        .arg("--retries")
+        .arg("2")
+        .arg("-f")
+        .arg("bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio")
+        .arg("-o")
+        .arg(&output_path)
+        .arg(&candidate.source_url);
+    hide_process_window(&mut command);
+
+    let output = match run_theme_command(command) {
+        Ok(output) => output,
+        Err(error) => {
+            remove_theme_artifacts(themes, game_id);
+            return Err(error);
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(400)
+            .collect::<String>();
+        remove_theme_artifacts(themes, game_id);
+        return Err(if stderr.is_empty() {
+            format!("téléchargement yt-dlp échoué ({})", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    let Some(path) = existing_theme(themes, game_id) else {
+        remove_theme_artifacts(themes, game_id);
+        return Err("yt-dlp n'a produit aucun format audio lisible".to_string());
+    };
+    let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    if size < THEME_MIN_FILE_BYTES {
+        remove_theme_artifacts(themes, game_id);
+        return Err(format!("fichier audio invalide ou tronqué ({size} octets)"));
+    }
+    Ok(path)
+}
+
+/// Musique de thème d'un jeu : cache re-validé, sinon recherche YouTube
+/// strictement filtrée. Aucun fichier n'est conservé si la correspondance
+/// n'atteint pas le seuil de confiance.
 #[tauri::command]
 async fn fetch_game_theme_auto(
     app: tauri::AppHandle,
@@ -1302,43 +2281,115 @@ async fn fetch_game_theme_auto(
         return Err("identifiant de jeu manquant".to_string());
     }
     let themes = themes_dir(&app)?;
-    if let Some(existing) = existing_theme(&themes, &game_id) {
-        return Ok(existing.to_string_lossy().to_string());
+
+    if existing_theme(&themes, &game_id).is_some() {
+        if cached_theme_is_valid(&themes, &game_id, &game_title) {
+            if let Some(existing) = existing_theme(&themes, &game_id) {
+                return Ok(existing.to_string_lossy().to_string());
+            }
+        }
+        // Ancien cache sans provenance, ou musique devenue non conforme : on
+        // la supprime avant toute nouvelle recherche.
+        eprintln!("[thème] cache non conforme purgé pour « {game_title} »");
+        remove_theme_artifacts(&themes, &game_id);
+    } else {
+        // Sidecar ou fichier partiel laissé par une tentative interrompue.
+        remove_theme_artifacts(&themes, &game_id);
+    }
+
+    if theme_fetch_cancelled() {
+        return Err("thème: téléchargement annulé".to_string());
     }
 
     let binary = ensure_yt_dlp(&app).await?;
+    if theme_fetch_cancelled() {
+        return Err("thème: téléchargement annulé".to_string());
+    }
 
-    let attempts = [
-        format!("{game_title} PS4 Theme Music"),
-        format!("{game_title} Main Menu Theme"),
+    let queries = [
+        format!("{game_title} original soundtrack"),
+        format!("{game_title} main theme"),
     ];
+    let mut candidates = Vec::new();
     let mut last_error = String::new();
 
-    for query in attempts {
+    for query in queries {
+        if theme_fetch_cancelled() {
+            return Err("thème: téléchargement annulé".to_string());
+        }
         let binary_for_task = binary.clone();
-        let themes_for_task = themes.clone();
-        let id_for_task = game_id.clone();
+        let query_for_task = query.clone();
         let result = tauri::async_runtime::spawn_blocking(move || {
-            run_yt_dlp(&binary_for_task, &themes_for_task, &id_for_task, &query)
+            search_theme_candidates(&binary_for_task, &query_for_task)
         })
         .await
-        .map_err(|e| format!("tâche yt-dlp interrompue: {e}"))?;
+        .map_err(|error| format!("tâche yt-dlp interrompue: {error}"))?;
 
-        if let Err(error) = result {
-            last_error = error;
-            eprintln!("[thème] recherche pour « {game_title} »: {last_error}");
-        }
-
-        if let Some(found) = existing_theme(&themes, &game_id) {
-            return Ok(found.to_string_lossy().to_string());
+        match result {
+            Ok(found) => merge_candidates(&mut candidates, found),
+            Err(error) => {
+                last_error = error;
+                eprintln!("[thème] recherche pour « {game_title} »: {last_error}");
+            }
         }
     }
 
-    Err(if last_error.is_empty() {
-        format!("aucune musique trouvée pour « {game_title} »")
-    } else {
-        last_error
+    if theme_fetch_cancelled() {
+        return Err("thème: téléchargement annulé".to_string());
+    }
+
+    let best = match pick_best_theme(&game_title, &candidates) {
+        Ok(best) => best,
+        Err(reason) => {
+            return Err(if last_error.is_empty() {
+                format!("aucune bande-son fiable pour « {game_title} » : {reason}")
+            } else {
+                format!("aucune bande-son fiable pour « {game_title} » : {reason} ({last_error})")
+            });
+        }
+    };
+
+    eprintln!(
+        "[thème] « {game_title} » → « {} » ({}, score {})",
+        best.title, best.channel, best.score
+    );
+
+    let binary_for_task = binary.clone();
+    let themes_for_task = themes.clone();
+    let id_for_task = game_id.clone();
+    let candidate_for_task = best.clone();
+    let downloaded = tauri::async_runtime::spawn_blocking(move || {
+        download_theme(
+            &binary_for_task,
+            &themes_for_task,
+            &id_for_task,
+            &candidate_for_task,
+        )
     })
+    .await
+    .map_err(|error| format!("tâche yt-dlp interrompue: {error}"))?;
+
+    let path = downloaded?;
+    // Un jeu a pu démarrer pendant le téléchargement : on ne conserve pas un
+    // fichier obtenu après la demande de pause.
+    if theme_fetch_cancelled() {
+        remove_theme_artifacts(&themes, &game_id);
+        return Err("thème: téléchargement annulé".to_string());
+    }
+    let metadata = ThemeMetadata {
+        version: THEME_VALIDATION_VERSION,
+        game_title: game_title.clone(),
+        match_title: best.title,
+        channel: best.channel,
+        video_id: best.video_id,
+        source_url: best.source_url,
+        duration: best.duration,
+    };
+    if let Err(error) = write_theme_metadata(&themes, &game_id, &metadata) {
+        remove_theme_artifacts(&themes, &game_id);
+        return Err(error);
+    }
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// Enregistre (ou efface) le chemin de la musique de thème d'un jeu.
@@ -1348,6 +2399,19 @@ fn set_game_theme_audio(
     game_id: String,
     theme_audio_path: Option<String>,
 ) -> Result<Vec<Game>, String> {
+    if let Some(path) = theme_audio_path.as_deref() {
+        let themes = themes_dir(&app)?;
+        let root = themes
+            .canonicalize()
+            .map_err(|error| format!("dossier des thèmes introuvable: {error}"))?;
+        let file = PathBuf::from(path)
+            .canonicalize()
+            .map_err(|error| format!("thème introuvable: {error}"))?;
+        if !file.starts_with(&root) {
+            return Err("chemin de thème hors du dossier autorisé".to_string());
+        }
+    }
+
     let mut games = load_games(&app)?;
     if let Some(game) = games.iter_mut().find(|game| game.id == game_id) {
         game.theme_audio_path = theme_audio_path;
@@ -1356,23 +2420,58 @@ fn set_game_theme_audio(
     Ok(games)
 }
 
-/// Supprime le fichier de thème d'un jeu et oublie son chemin : la prochaine
-/// génération repart d'une recherche neuve.
+/// Supprime le fichier de thème (et sa provenance) d'un jeu et oublie son
+/// chemin : la prochaine génération repart d'une recherche neuve.
 #[tauri::command]
 fn clear_game_theme(app: tauri::AppHandle, game_id: String) -> Result<Vec<Game>, String> {
     let themes = themes_dir(&app)?;
-    for ext in THEME_EXTENSIONS {
-        let candidate = themes.join(format!("{game_id}.{ext}"));
-        if candidate.is_file() {
-            let _ = fs::remove_file(&candidate);
-        }
-    }
+    remove_theme_artifacts(&themes, &game_id);
 
     let mut games = load_games(&app)?;
     if let Some(game) = games.iter_mut().find(|game| game.id == game_id) {
         game.theme_audio_path = None;
     }
     save_games(&app, &games)?;
+    Ok(games)
+}
+
+/// Purge les caches audio antérieurs au durcissement des règles, les fichiers
+/// sans provenance et les associations devenues invalides. Ne touche jamais au
+/// réseau : appelé au démarrage, avant la file de téléchargement.
+#[tauri::command]
+fn revalidate_game_themes(app: tauri::AppHandle) -> Result<Vec<Game>, String> {
+    let themes = themes_dir(&app)?;
+    let mut games = load_games(&app)?;
+    let mut changed = false;
+
+    for game in games.iter_mut() {
+        let Some(path) = existing_theme(&themes, &game.id) else {
+            let had_path = game.theme_audio_path.take().is_some();
+            changed |= had_path;
+            // Supprime un sidecar orphelin ou un fichier partiel.
+            remove_theme_artifacts(&themes, &game.id);
+            continue;
+        };
+
+        if !cached_theme_is_valid(&themes, &game.id, &game.title) {
+            eprintln!("[thème] cache invalide purgé pour « {} »", game.title);
+            remove_theme_artifacts(&themes, &game.id);
+            if game.theme_audio_path.take().is_some() {
+                changed = true;
+            }
+            continue;
+        }
+
+        let path = path.to_string_lossy().to_string();
+        if game.theme_audio_path.as_deref() != Some(path.as_str()) {
+            game.theme_audio_path = Some(path);
+            changed = true;
+        }
+    }
+
+    if changed {
+        save_games(&app, &games)?;
+    }
     Ok(games)
 }
 
@@ -1406,7 +2505,7 @@ fn remove_game_cache(app: &tauri::AppHandle, game_id: &str) {
     let Ok(data_dir) = app.path().app_data_dir() else {
         return;
     };
-    remove_cache_files(&data_dir.join(THEMES_DIR), game_id);
+    remove_theme_artifacts(&data_dir.join(THEMES_DIR), game_id);
     if let Ok(file) = icon_file(game_id) {
         if let Some(stem) = Path::new(&file).file_stem().and_then(|name| name.to_str()) {
             remove_cache_files(&data_dir.join(ICONS_DIR), stem);
@@ -1780,8 +2879,7 @@ fn vdf_tokens(line: &str) -> Vec<String> {
 fn vdf_value(content: &str, key: &str) -> Option<String> {
     content.lines().find_map(|line| {
         let tokens = vdf_tokens(line);
-        (tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case(key))
-            .then(|| tokens[1].clone())
+        (tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case(key)).then(|| tokens[1].clone())
     })
 }
 
@@ -1791,16 +2889,15 @@ fn vdf_quoted_values(content: &str, key: &str) -> Vec<String> {
         .lines()
         .filter_map(|line| {
             let tokens = vdf_tokens(line);
-            (tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case(key))
-                .then(|| tokens[1].clone())
+            (tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case(key)).then(|| tokens[1].clone())
         })
         .collect()
 }
 
 #[cfg(target_os = "windows")]
 fn steam_path_from_registry() -> Option<PathBuf> {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
     use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
 
     let key = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags("Software\\Valve\\Steam", KEY_READ)
@@ -1866,9 +2963,7 @@ fn steam_library_roots(steam_root: &Path) -> Vec<PathBuf> {
         } else {
             candidate
         };
-        if candidate.join("steamapps").is_dir()
-            && !roots.iter().any(|root| root == &candidate)
-        {
+        if candidate.join("steamapps").is_dir() && !roots.iter().any(|root| root == &candidate) {
             roots.push(candidate);
         }
     }
@@ -1913,8 +3008,7 @@ fn detect_steam_games() -> Vec<DetectedGame> {
                         title.trim().to_string()
                     },
                     platform: "steam".to_string(),
-                    steam_appid: (!appid.trim().is_empty())
-                        .then(|| appid.trim().to_string()),
+                    steam_appid: (!appid.trim().is_empty()).then(|| appid.trim().to_string()),
                 });
             }
         }
@@ -2014,8 +3108,8 @@ fn detect_gog_games() -> Vec<DetectedGame> {
 
 #[cfg(target_os = "windows")]
 fn detect_gog_registry() -> Vec<DetectedGame> {
-    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
     use winreg::RegKey;
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
 
     let Ok(container) = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(r"SOFTWARE\WOW6432Node\GOG.com\Games", KEY_READ)
@@ -2291,11 +3385,7 @@ fn update_launch_options(
 }
 
 #[tauri::command]
-fn set_game_pinned(
-    app: tauri::AppHandle,
-    id: String,
-    pinned: bool,
-) -> Result<Vec<Game>, String> {
+fn set_game_pinned(app: tauri::AppHandle, id: String, pinned: bool) -> Result<Vec<Game>, String> {
     let mut games = load_games(&app)?;
     {
         let game = games
@@ -2317,8 +3407,39 @@ fn remove_game(app: tauri::AppHandle, id: String) -> Result<Vec<Game>, String> {
     Ok(games)
 }
 
+struct LaunchLockGuard {
+    release_on_drop: bool,
+}
+
+impl LaunchLockGuard {
+    fn acquire() -> Result<Self, String> {
+        if GAME_LAUNCH_LOCK
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("un lancement de jeu est déjà en cours".to_string());
+        }
+        Ok(Self {
+            release_on_drop: true,
+        })
+    }
+}
+
+impl Drop for LaunchLockGuard {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            GAME_LAUNCH_LOCK.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 #[tauri::command]
 fn launch_game(app: tauri::AppHandle, id: String) -> Result<Vec<Game>, String> {
+    let mut launch_lock = LaunchLockGuard::acquire().map_err(|error| {
+        eprintln!("[jeu] lancement de {id} refusé : {error}");
+        error
+    })?;
+
     let mut games = load_games(&app)?;
     let index = games
         .iter()
@@ -2341,15 +3462,43 @@ fn launch_game(app: tauri::AppHandle, id: String) -> Result<Vec<Game>, String> {
     }
     save_games(&app, &games)?;
 
-    // Instant exact du démarrage, avant même la minimisation.
+    // Instant exact du démarrage. Le splash reste au premier plan tant que le
+    // jeu n'a pas affiché sa première image : le launcher n'est pas minimisé
+    // ici, mais par le thread de surveillance une fois la fenêtre trouvée.
     let started = std::time::Instant::now();
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.minimize();
+
+    // Processus déjà actif (lancement manuel, ancienne session du launcher) :
+    // on ne démarre jamais un second exemplaire. On ramène sa fenêtre au
+    // premier plan et on adopte la session existante pour le suivi du temps.
+    #[cfg(target_os = "windows")]
+    if let Some(pid) = process_guard::find_pid(&exe) {
+        eprintln!("[jeu] « {title} » déjà actif (PID {pid}) : second lancement bloqué");
+        if !game_window::focus_pid(pid) {
+            eprintln!("[jeu] fenêtre du processus {pid} introuvable pour le focus");
+        }
+        let game_root = game_root_dir(&exe);
+        let session_app = app.clone();
+        let session_id = id;
+        std::thread::spawn(move || {
+            let _ = session_app.emit(
+                "game-window-ready",
+                GameWindowReady {
+                    game_id: session_id.clone(),
+                },
+            );
+            let (elapsed, exit_code) = monitor_game_processes(&game_root, started, None, false);
+            finish_game_session(&session_app, &session_id, elapsed, exit_code);
+        });
+        // Le thread de session devient propriétaire du verrou et le libérera
+        // dans finish_game_session.
+        launch_lock.release_on_drop = false;
+        return Ok(games);
     }
 
     if let Err(error) = run_game_session(app.clone(), exe, title, args, id, started) {
-        // Échec du lancement : le launcher ne doit pas rester minimisé.
+        // Échec du lancement : le launcher ne doit pas rester au premier plan.
         if let Some(window) = app.get_webview_window("main") {
+            let _ = window.set_always_on_top(false);
             let _ = window.unminimize();
             let _ = window.set_focus();
             let _ = window.set_fullscreen(true);
@@ -2357,6 +3506,9 @@ fn launch_game(app: tauri::AppHandle, id: String) -> Result<Vec<Game>, String> {
         return Err(error);
     }
 
+    // La session (et son thread de surveillance) libérera le verrou à la
+    // fermeture réelle du jeu.
+    launch_lock.release_on_drop = false;
     Ok(games)
 }
 
@@ -2373,10 +3525,7 @@ fn add_playtime(app: tauri::AppHandle, game_id: String, seconds: u64) -> Result<
 }
 
 #[tauri::command]
-async fn fetch_game_artwork(
-    app: tauri::AppHandle,
-    game_id: String,
-) -> Result<Vec<Game>, String> {
+async fn fetch_game_artwork(app: tauri::AppHandle, game_id: String) -> Result<Vec<Game>, String> {
     let games = load_games(&app)?;
     let index = games
         .iter()
@@ -2418,8 +3567,7 @@ async fn fetch_game_artwork(
     let cover_path = directory.join(&cover_file);
     let mut cover_saved = false;
     if !api_key.is_empty() {
-        if let Some(url) =
-            steamgriddb_square_cover_url(&client, &api_key, appid_ref, &title).await
+        if let Some(url) = steamgriddb_square_cover_url(&client, &api_key, appid_ref, &title).await
         {
             cover_saved = download_image(&client, &url, &cover_path).await.is_ok();
         }
@@ -2427,7 +3575,9 @@ async fn fetch_game_artwork(
     if !cover_saved {
         if let Some(appid) = appid_ref {
             let fallback = format!("{STEAM_ARTWORK}/{appid}/library_600x900_2x.jpg");
-            cover_saved = download_image(&client, &fallback, &cover_path).await.is_ok();
+            cover_saved = download_image(&client, &fallback, &cover_path)
+                .await
+                .is_ok();
         }
     }
     let mut cover_url_update: Option<String> = None;
@@ -2444,16 +3594,11 @@ async fn fetch_game_artwork(
     #[cfg(target_os = "windows")]
     {
         let cached_cover = games[index].cover_url.as_deref().is_some_and(|url| {
-            url.starts_with(COVERS_SCHEME)
-                || url.starts_with(&format!("http://{COVERS_SCHEME}."))
+            url.starts_with(COVERS_SCHEME) || url.starts_with(&format!("http://{COVERS_SCHEME}."))
         });
         if !cover_saved && !cached_cover {
             if let (Ok(file), Ok(directory)) = (icon_file(&game_id), icons_dir(&app)) {
-                if write_exe_icon(
-                    Path::new(&games[index].exe_path),
-                    &directory.join(&file),
-                )
-                .is_ok()
+                if write_exe_icon(Path::new(&games[index].exe_path), &directory.join(&file)).is_ok()
                 {
                     cover_url_update = Some(cached_icon_url(&file, stamp));
                 }
@@ -2474,7 +3619,10 @@ async fn fetch_game_artwork(
         }
         if !hero_saved {
             for candidate in steam_candidates(appid, ArtworkKind::Hero) {
-                if download_image(&client, &candidate, &hero_path).await.is_ok() {
+                if download_image(&client, &candidate, &hero_path)
+                    .await
+                    .is_ok()
+                {
                     hero_saved = true;
                     break;
                 }
@@ -2583,7 +3731,8 @@ fn update_avatar(app: tauri::AppHandle, file_path: String) -> Result<UserProfile
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir indisponible: {e}"))?;
-    fs::create_dir_all(&dir).map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
     let target = dir.join(format!("avatar.{extension}"));
     fs::write(&target, &bytes)
         .map_err(|e| format!("écriture de {} impossible: {e}", target.display()))?;
@@ -2647,8 +3796,8 @@ fn write_exe_icon(exe: &Path, target: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use winapi::shared::windef::{HGDIOBJ, HICON};
     use winapi::um::wingdi::{
-        CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, SelectObject,
-        BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
+        BI_RGB, BITMAP, BITMAPINFO, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject,
+        GetDIBits, GetObjectW, SelectObject,
     };
     use winapi::um::winuser::{DestroyIcon, GetIconInfo, ICONINFO};
 
@@ -2795,8 +3944,14 @@ mod tests {
     #[test]
     fn title_falls_back_to_folder_for_generic_names() {
         let dir = Path::new("/games/My_Game");
-        assert_eq!(derive_title(Path::new("/games/My_Game/launcher.exe"), dir), "My Game");
-        assert_eq!(derive_title(Path::new("/games/My_Game/GTA V.exe"), dir), "GTA V");
+        assert_eq!(
+            derive_title(Path::new("/games/My_Game/launcher.exe"), dir),
+            "My Game"
+        );
+        assert_eq!(
+            derive_title(Path::new("/games/My_Game/GTA V.exe"), dir),
+            "GTA V"
+        );
     }
 
     #[test]
@@ -2831,6 +3986,15 @@ mod tests {
     }
 
     #[test]
+    fn launch_lock_rejects_concurrent_acquisition() {
+        let first = LaunchLockGuard::acquire().expect("premier lancement accepté");
+        assert!(LaunchLockGuard::acquire().is_err());
+        drop(first);
+        let second = LaunchLockGuard::acquire().expect("verrou libéré après la session");
+        drop(second);
+    }
+
+    #[test]
     fn normalizes_titles_for_steam_matching() {
         assert_eq!(
             normalize_title("Grand Theft Auto V"),
@@ -2861,10 +4025,7 @@ mod tests {
         .unwrap();
         // Même depuis un sous-dossier, le dossier de jeu reste le premier
         // segment sous `common`.
-        assert_eq!(
-            find_steam_appid(&game.join("bin")).as_deref(),
-            Some("620")
-        );
+        assert_eq!(find_steam_appid(&game.join("bin")).as_deref(), Some("620"));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2997,6 +4158,122 @@ mod tests {
         assert!(hero[0].ends_with("/730/library_hero_2x.jpg"));
         assert!(hero.last().unwrap().ends_with("/730/header.jpg"));
     }
+
+    #[test]
+    fn theme_normalization_keeps_years_and_folds_accents() {
+        assert_eq!(normalize_theme_text("Ragnarök™"), "ragnarok");
+        assert_eq!(normalize_theme_text("DOOM (2016)"), "doom 2016");
+        assert_eq!(
+            normalize_theme_text("Assassin's Creed IV: Black Flag"),
+            "assassins creed iv black flag"
+        );
+    }
+
+    #[test]
+    fn theme_accepts_exact_official_track() {
+        let score = validate_theme_candidate(
+            "The Witcher 3: Wild Hunt",
+            "The Witcher 3: Wild Hunt — Official Soundtrack",
+            "CD PROJEKT RED",
+            Some(245.0),
+        );
+        assert!(score.is_some_and(|score| score >= THEME_MIN_CONFIDENCE));
+    }
+
+    #[test]
+    fn theme_strips_marketing_editions() {
+        assert!(
+            validate_theme_candidate(
+                "Elden Ring Deluxe Edition",
+                "Elden Ring OST",
+                "Bandai Namco",
+                Some(180.0),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn theme_rejects_partial_or_extended_title_collisions() {
+        assert!(
+            validate_theme_candidate("DOOM", "DOOM Eternal OST", "Bethesda", Some(200.0)).is_none()
+        );
+        assert!(
+            validate_theme_candidate("DOOM Eternal", "DOOM OST", "Bethesda", Some(200.0)).is_none()
+        );
+        assert!(
+            validate_theme_candidate("DOOM", "DOOM (2016) OST", "Bethesda", Some(200.0)).is_none()
+        );
+    }
+
+    #[test]
+    fn theme_rejects_covers_remixes_and_trailers() {
+        for title in [
+            "DOOM OST (Piano Cover)",
+            "DOOM OST Nightcore Remix",
+            "DOOM OST - Gameplay Trailer",
+        ] {
+            assert!(
+                validate_theme_candidate("DOOM", title, "Some Channel", Some(180.0)).is_none(),
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn theme_rejects_without_official_marker_or_with_bad_duration() {
+        assert!(validate_theme_candidate("DOOM", "DOOM Theme", "Official", Some(180.0)).is_none());
+        assert!(validate_theme_candidate("DOOM", "DOOM OST", "Official", Some(12.0)).is_none());
+        assert!(validate_theme_candidate("DOOM", "DOOM OST", "Official", Some(601.0)).is_none());
+        assert!(validate_theme_candidate("DOOM", "DOOM OST", "Official", None).is_none());
+    }
+
+    #[test]
+    fn theme_rejects_ambiguous_duplicates() {
+        let candidates = vec![
+            ThemeCandidate {
+                video_id: "a".into(),
+                title: "DOOM OST".into(),
+                channel: "Topic".into(),
+                duration: Some(200.0),
+                source_url: "a".into(),
+                score: 0,
+            },
+            ThemeCandidate {
+                video_id: "b".into(),
+                title: "DOOM OST".into(),
+                channel: "Topic".into(),
+                duration: Some(200.0),
+                source_url: "b".into(),
+                score: 0,
+            },
+        ];
+        assert!(pick_best_theme("DOOM", &candidates).is_err());
+    }
+
+    #[test]
+    fn theme_picks_unique_high_confidence_result() {
+        let candidates = vec![
+            ThemeCandidate {
+                video_id: "a".into(),
+                title: "DOOM OST".into(),
+                channel: "Bethesda Softworks".into(),
+                duration: Some(200.0),
+                source_url: "a".into(),
+                score: 0,
+            },
+            ThemeCandidate {
+                video_id: "b".into(),
+                title: "DOOM OST (Piano Cover)".into(),
+                channel: "Piano Covers".into(),
+                duration: Some(200.0),
+                source_url: "b".into(),
+                score: 0,
+            },
+        ];
+        let picked = pick_best_theme("DOOM", &candidates).expect("unique result");
+        assert_eq!(picked.video_id, "a");
+    }
 }
 
 /* ────────────── Batterie de la manette ────────────── */
@@ -3045,8 +4322,7 @@ struct XInputBatteryInformation {
 }
 
 #[cfg(target_os = "windows")]
-type XInputGetStateFn =
-    unsafe extern "system" fn(user_index: u32, state: *mut XInputState) -> u32;
+type XInputGetStateFn = unsafe extern "system" fn(user_index: u32, state: *mut XInputState) -> u32;
 #[cfg(target_os = "windows")]
 type XInputGetBatteryInformationFn = unsafe extern "system" fn(
     user_index: u32,
@@ -3094,9 +4370,8 @@ fn load_xinput() -> Option<(XInputGetStateFn, XInputGetBatteryInformationFn)> {
 
 #[cfg(target_os = "windows")]
 fn xinput_api() -> Option<(XInputGetStateFn, XInputGetBatteryInformationFn)> {
-    static API: std::sync::OnceLock<
-        Option<(XInputGetStateFn, XInputGetBatteryInformationFn)>,
-    > = std::sync::OnceLock::new();
+    static API: std::sync::OnceLock<Option<(XInputGetStateFn, XInputGetBatteryInformationFn)>> =
+        std::sync::OnceLock::new();
     *API.get_or_init(load_xinput)
 }
 
@@ -3119,9 +4394,8 @@ fn controller_battery() -> Option<u8> {
         }
 
         let mut battery = XInputBatteryInformation::default();
-        let known = unsafe {
-            xinput_get_battery(index, BATTERY_DEVTYPE_GAMEPAD, &mut battery)
-        } == ERROR_SUCCESS;
+        let known = unsafe { xinput_get_battery(index, BATTERY_DEVTYPE_GAMEPAD, &mut battery) }
+            == ERROR_SUCCESS;
         if !known {
             // Manette connectée mais charge inconnue : on l'affiche pleine
             // plutôt que de faire disparaître l'indicateur.
@@ -3214,6 +4488,9 @@ pub fn run() {
             set_game_theme_audio,
             read_theme_audio,
             clear_game_theme,
+            revalidate_game_themes,
+            cancel_theme_fetch,
+            resume_theme_fetch,
             add_game,
             scan_games_directory,
             detect_installed_pc_games,

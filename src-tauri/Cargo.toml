@@ -1,6 +1,6 @@
 [package]
 name = "ps4-launcher"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2024"
@@ -35,7 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sysinfo = "0.32"
 winreg = "0.52"
 # Extraction des icônes .exe et encodage PNG, uniquement dans le binaire Windows.
-winapi = { version = "0.3", features = ["winuser", "wingdi"] }
+winapi = { version = "0.3", features = ["winuser", "wingdi", "dwmapi", "processthreadsapi", "handleapi", "winbase", "winnt", "tlhelp32"] }
 png = "0.17"
 
 

@@ -341,8 +341,12 @@ export function ProfileModal({
   useEffect(() => {
     let frame = 0;
     let lastNav = 0;
-    let lastConfirm = false;
-    let lastBack = false;
+    // La modale s'ouvre sur la croix qui a validé « Profil » dans la barre
+    // système : ce bouton est encore enfoncé au premier tick. On part donc
+    // des fronts « appuyés » pour exiger un relâchement, sinon la première
+    // ligne (Modifier l'avatar) s'active et ouvre le sélecteur de fichiers.
+    let lastConfirm = true;
+    let lastBack = true;
 
     const tick = (time: number) => {
       frame = requestAnimationFrame(tick);

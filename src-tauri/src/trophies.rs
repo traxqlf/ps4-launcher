@@ -498,7 +498,8 @@ fn cache_path(app: &tauri::AppHandle, appid: &str) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("app_data_dir indisponible: {e}"))?
         .join("trophies");
-    fs::create_dir_all(&dir).map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("création de {} impossible: {e}", dir.display()))?;
     Ok(dir.join(format!("{appid}.json")))
 }
 
@@ -530,10 +531,11 @@ fn unlocked_paths(app: &tauri::AppHandle, appid: &str) -> Vec<PathBuf> {
     let Ok(dir) = app.path().app_data_dir() else {
         return Vec::new();
     };
-    vec![dir
-        .join("trophies")
-        .join("unlocked")
-        .join(format!("{appid}.json"))]
+    vec![
+        dir.join("trophies")
+            .join("unlocked")
+            .join(format!("{appid}.json")),
+    ]
 }
 
 fn earned_time_of(value: &Value) -> u64 {
@@ -708,8 +710,8 @@ async fn load_percentages(
             let raw = fs::read_to_string(&cache).map_err(|_| {
                 format!("aucun trophée disponible en ligne ou en cache pour l'appid {appid}")
             })?;
-            let entries = serde_json::from_str(&raw)
-                .map_err(|e| format!("cache trophées invalide: {e}"))?;
+            let entries =
+                serde_json::from_str(&raw).map_err(|e| format!("cache trophées invalide: {e}"))?;
             Ok((entries, true))
         }
     }
@@ -1226,10 +1228,9 @@ mod tests {
 
     #[test]
     fn accepts_string_and_numeric_percentages() {
-        let mixed: Vec<PercentEntry> = serde_json::from_str(
-            r#"[{"name":"A","percent":"74.9"},{"name":"B","percent":5}]"#,
-        )
-        .unwrap();
+        let mixed: Vec<PercentEntry> =
+            serde_json::from_str(r#"[{"name":"A","percent":"74.9"},{"name":"B","percent":5}]"#)
+                .unwrap();
         assert_eq!(mixed[0].percent, 74.9);
         assert_eq!(mixed[1].percent, 5.0);
     }
