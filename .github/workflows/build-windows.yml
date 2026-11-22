@@ -89,6 +89,12 @@ jobs:
         with:
           tag_name: v${{ steps.manifest.outputs.version }}
           name: PulsePS4 v${{ steps.manifest.outputs.version }}
+          body: |
+            ## PulsePS4 v${{ steps.manifest.outputs.version }}
+
+            - Mise à jour NSIS automatique et transparente sans re-téléchargement manuel
+            - Détection locale des AppID et synchronisation complète des trophées
+            - Empreinte ultra-légère (0 % CPU en jeu)
           make_latest: true
           fail_on_unmatched_files: true
           files: |

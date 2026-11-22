@@ -1279,9 +1279,6 @@ mod process_guard {
 // Suivi du jeu lancé : temps de jeu réel, même avec un lanceur intermédiaire.
 // --------------------------------------------------------------------------
 
-#[cfg(target_os = "windows")]
-const PROCESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
-
 /// Écart entre deux lectures de la table des processus : 5 s suffisent pour
 /// mesurer une session et gardent un coût CPU nul pendant la partie.
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_secs(5);
