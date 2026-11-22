@@ -13,6 +13,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { TrophyModal, type TrophyReport } from "./TrophyModal";
+import { AudioSettingsModal } from "./AudioSettingsModal";
 import { ProfileModal } from "./ProfileModal";
 import { notify } from "./Ps4Notification";
 import { Ps4Clock } from "./Ps4Clock";
@@ -20,14 +21,17 @@ import { Ps4LibraryView } from "./Ps4LibraryView";
 import { Ps4FlowBackground } from "./Ps4FlowBackground";
 import { Ps4SplashScreen } from "./Ps4SplashScreen";
 import {
+  getInputMode,
   hasSystemModifier,
   isMenuKey,
   isGamepadSuspended,
   isTypingTarget,
   setGamepadSuspended,
   setGlobalGamepadLock,
+  shouldIgnoreClick,
   useGamepad,
 } from "../hooks/useGamepad";
+import { setGameAudioBlocked } from "../hooks/useAudioGate";
 import {
   applyEqPreset,
   EQ_PRESETS,
@@ -46,6 +50,7 @@ import {
   playSystemMessage,
   playThemeMusic,
   playTrophy,
+  previewEffectsVolume,
   resumeAudioEngine,
   resumeBgm,
   stopThemeMusic,
@@ -232,10 +237,17 @@ interface TrophyToast {
   icon: string;
 }
 
-/** Émis par le back à la fermeture réelle du jeu, durée réelle incluse. */
+/**
+ * Émis par le back à la fermeture réelle du jeu. La durée est déjà créditée et
+ * écrite sur le disque : le total fait foi, le front ne l'additionne pas.
+ */
 interface GameSessionEnded {
   gameId: string;
   durationSeconds: number;
+  /** Total cumulé enregistré par Rust pour ce jeu. */
+  totalPlaytimeSeconds?: number;
+  /** Date de la dernière session (ms epoch), pour le tri « Récents ». */
+  lastPlayed?: number | null;
   /** Code de sortie du processus lancé, absent s'il a été tué par un signal. */
   exitCode?: number | null;
   /** Session très courte terminée avec un code non nul. */
@@ -254,143 +266,6 @@ function formatPlaytime(seconds: number): string {
     return `${minutes} min jouées`;
   }
   return `${(seconds / 3600).toFixed(1).replace(".", ",")} h jouées`;
-}
-
-/** Curseur horizontal style Centre de contrôle : clic, glisser, pas de 5 %. */
-function GlassSlider({
-  value,
-  onChange,
-  onFocus,
-  label,
-}: {
-  value: number;
-  onChange: (value: number) => void;
-  onFocus: () => void;
-  label: string;
-}) {
-  const apply = (clientX: number, element: HTMLElement) => {
-    const rect = element.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-    onChange(Math.round((ratio * 100) / 5) * 5);
-  };
-
-  return (
-    <div
-      role="slider"
-      tabIndex={-1}
-      aria-label={label}
-      aria-valuemin={0}
-      aria-valuemax={100}
-      aria-valuenow={value}
-      style={SST_STYLE}
-      onPointerDown={(event) => {
-        onFocus();
-        event.currentTarget.setPointerCapture(event.pointerId);
-        apply(event.clientX, event.currentTarget);
-      }}
-      onPointerMove={(event) => {
-        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-          apply(event.clientX, event.currentTarget);
-        }
-      }}
-      className="relative h-5 flex-1 cursor-pointer touch-none overflow-hidden rounded-full border border-sky-300/15 bg-[#031338]/80 shadow-[inset_0_1px_2px_rgba(0,0,0,0.35)] outline-none"
-    >
-      <div
-        className="h-full rounded-full bg-gradient-to-r from-[#0072ce] via-[#00a2ff] to-white shadow-[0_0_12px_rgba(0,162,255,0.55)] transition-[width] duration-150 ease-out"
-        style={{ width: `${value}%` }}
-      />
-    </div>
-  );
-}
-
-/** Fader vertical -12…+12 dB : remplissage depuis le centre, graduation fine. */
-function GlassFader({
-  value,
-  onChange,
-  onFocus,
-  active,
-  label,
-}: {
-  value: number;
-  onChange: (value: number) => void;
-  onFocus: () => void;
-  active: boolean;
-  label: string;
-}) {
-  const ratio = Math.min(1, Math.abs(value) / 12);
-
-  const apply = (clientY: number, element: HTMLElement) => {
-    const rect = element.getBoundingClientRect();
-    if (rect.height <= 0) return;
-    const ratioY = Math.min(
-      1,
-      Math.max(0, 1 - (clientY - rect.top) / rect.height),
-    );
-    onChange(Math.round(ratioY * 24 - 12));
-  };
-
-  return (
-    <div
-      role="slider"
-      tabIndex={-1}
-      aria-label={label}
-      aria-orientation="vertical"
-      aria-valuemin={-12}
-      aria-valuemax={12}
-      aria-valuenow={value}
-      style={SST_STYLE}
-      onPointerDown={(event) => {
-        onFocus();
-        event.currentTarget.setPointerCapture(event.pointerId);
-        apply(event.clientY, event.currentTarget);
-      }}
-      onPointerMove={(event) => {
-        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-          apply(event.clientY, event.currentTarget);
-        }
-      }}
-      className={`relative mx-auto h-24 w-10 cursor-pointer touch-none rounded-xl outline-none transition-all duration-200 ease-out ${
-        active
-          ? "bg-sky-400/[0.08] shadow-[0_0_0_1px_rgba(125,211,252,0.45),0_0_18px_rgba(0,114,206,0.45)]"
-          : "hover:bg-sky-300/[0.06]"
-      }`}
-    >
-      <span
-        aria-hidden="true"
-        style={SST_STYLE}
-        className="absolute right-0.5 top-1/2 -translate-y-1/2 text-[8px] leading-none text-sky-200/35"
-      >
-        0
-      </span>
-      <div className="absolute inset-y-1.5 left-1/2 w-2 -translate-x-1/2">
-        <div className="absolute inset-0 rounded-full border border-sky-300/10 bg-[#031338]/80 shadow-[inset_0_1px_2px_rgba(0,0,0,0.35)]" />
-        {[0, 25, 50, 75, 100].map((top) => (
-          <span
-            key={top}
-            aria-hidden="true"
-            className={`absolute left-1/2 h-px -translate-x-1/2 ${
-              top === 50 ? "w-3 bg-sky-200/50" : "w-1 bg-sky-200/20"
-            }`}
-            style={{ top: `${top}%` }}
-          />
-        ))}
-        <div
-          className="absolute left-0 w-full rounded-full bg-gradient-to-t from-[#0072ce] via-[#00a2ff] to-white shadow-[0_0_12px_rgba(0,162,255,0.55)]"
-          style={
-            value >= 0
-              ? { bottom: "50%", height: `${ratio * 50}%` }
-              : { top: "50%", height: `${ratio * 50}%` }
-          }
-        />
-        <span
-          aria-hidden="true"
-          className="absolute left-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-sky-100/80 bg-gradient-to-b from-white to-sky-100 shadow-[0_1px_4px_rgba(0,12,36,0.5),0_0_8px_rgba(0,162,255,0.4)]"
-          style={{ top: `${50 - (value / 12) * 50}%` }}
-        />
-      </div>
-    </div>
-  );
 }
 
 /** Icône batterie PS4 : coque et trois barres, affichée dès qu'une manette répond. */
@@ -477,6 +352,8 @@ export function Ps4Home({
   audioIndexRef.current = audioIndex;
   // Jeu concerné par les options : celui du ruban, ou une tuile de la grille.
   const [optionsGame, setOptionsGame] = useState<Game | null>(null);
+  // Jeu dont la liste de trophées est ouverte.
+  const [trophiesTarget, setTrophiesTarget] = useState<Game | null>(null);
   // Vue Bibliothèque plein écran, ouverte depuis sa tuile permanente.
   const [libraryOpen, setLibraryOpen] = useState(false);
   // Le launcher minimisé pour un jeu ne doit pas animer le fond en arrière-plan.
@@ -510,12 +387,41 @@ export function Ps4Home({
   // n'ouvre qu'une seule fenêtre par appui.
   const lastStoreOpen = useRef(0);
 
-  // Mise à jour du logiciel système : détection unique au démarrage, puis
-  // bandeau PS4 cliquable en haut à gauche.
+  // Mise à jour du logiciel système : détection au démarrage puis installation
+  // silencieuse (l'installeur NSIS relance le launcher), sans retéléchargement
+  // manuel. Le bandeau PS4 ne sert plus que d'indicateur ou de secours.
   const [systemUpdate, setSystemUpdate] = useState<Update | null>(null);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const updateCheckStarted = useRef(false);
+  const installingUpdateRef = useRef(false);
+  const gameSessionActiveRef = useRef(false);
+  gameSessionActiveRef.current = gameSessionActive;
+
+  // Téléchargement + installation. Sur Windows, l'installeur NSIS prend le
+  // relais en mode silencieux et relance l'application tout seul.
+  const installSystemUpdate = async (target?: Update | null) => {
+    const update = target ?? systemUpdate;
+    if (!update || installingUpdateRef.current) return;
+    // Jamais pendant une partie (0 % CPU réseau côté launcher, jeu intact).
+    if (isLaunchingRef.current || gameSessionActiveRef.current) return;
+    installingUpdateRef.current = true;
+    setSystemUpdate(update);
+    setInstallingUpdate(true);
+    setUpdateError(null);
+    playDialogYes();
+    try {
+      await update.downloadAndInstall();
+      await relaunch();
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      console.error("[mise à jour] installation impossible:", caught);
+      installingUpdateRef.current = false;
+      setInstallingUpdate(false);
+      setUpdateError(message);
+      playError();
+    }
+  };
 
   useEffect(() => {
     // Production uniquement : en dev, la vérification interrogerait la release
@@ -523,6 +429,7 @@ export function Ps4Home({
     if (import.meta.env.DEV || updateCheckStarted.current) return;
     updateCheckStarted.current = true;
     let cancelled = false;
+    let autoInstallTimer = 0;
 
     const lookForUpdate = async () => {
       try {
@@ -530,6 +437,11 @@ export function Ps4Home({
         if (cancelled || !found) return;
         setSystemUpdate(found);
         playSystemMessage();
+        // Délai court : le bandeau s'affiche, puis l'installation démarre
+        // seule. Aucun `.exe` à retélécharger depuis GitHub.
+        autoInstallTimer = window.setTimeout(() => {
+          if (!cancelled) void installSystemUpdate(found);
+        }, 2500);
       } catch (caught) {
         console.error("[mise à jour] vérification impossible:", caught);
       }
@@ -538,27 +450,10 @@ export function Ps4Home({
     void lookForUpdate();
     return () => {
       cancelled = true;
+      window.clearTimeout(autoInstallTimer);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Clic sur le bandeau : téléchargement, installation, puis redémarrage du
-  // launcher. En cas d'échec le bandeau reste affiché pour réessayer.
-  const installSystemUpdate = async () => {
-    if (!systemUpdate || installingUpdate) return;
-    setInstallingUpdate(true);
-    setUpdateError(null);
-    playDialogYes();
-    try {
-      await systemUpdate.downloadAndInstall();
-      await relaunch();
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : String(caught);
-      console.error("[mise à jour] installation impossible:", caught);
-      setInstallingUpdate(false);
-      setUpdateError(message);
-      playError();
-    }
-  };
 
   // Moteur du ruban : les refs DOM et l'état physique restent hors de React,
   // seule la sélection change d'un rendu à l'autre.
@@ -822,25 +717,14 @@ export function Ps4Home({
       document.removeEventListener("visibilitychange", onVisibilityChange);
   }, []);
 
+  // L'état de jeu est publié vers le verrou audio central (monté dans App) :
+  // dès le clic sur « Démarrer » et jusqu'à la fin réelle de la session.
   useEffect(() => {
-    // Minimisé pour un jeu : le moteur Web Audio est suspendu. Au retour au
-    // premier plan, il reprend avec la musique du menu.
-    const onFocus = () => {
-      resumeAudioEngine();
-      resumeBgm();
-      // Retour au launcher : la boucle manette reprend son polling.
-      setGamepadSuspended(false);
-    };
-    const onBlur = () => {
-      suspendAudioEngine();
-    };
-    window.addEventListener("focus", onFocus);
-    window.addEventListener("blur", onBlur);
-    return () => {
-      window.removeEventListener("focus", onFocus);
-      window.removeEventListener("blur", onBlur);
-    };
-  }, []);
+    setGameAudioBlocked(launchingGame !== null || gameSessionActive);
+  }, [launchingGame, gameSessionActive]);
+
+  // Seul un démontage (fermeture du launcher) relâche le verrou.
+  useEffect(() => () => setGameAudioBlocked(false), []);
 
   useEffect(() => {
     invoke<UserProfile>("get_profile")
@@ -917,8 +801,9 @@ export function Ps4Home({
     };
   }, []);
 
-  // Fin de session : le back a restauré la fenêtre et mesuré la durée réelle.
-  // On réactive l'audio, on crédite le temps de jeu puis on persiste aussitôt.
+  // Fin de session : le back a restauré la fenêtre, mesuré la durée réelle et
+  // déjà écrit le nouveau total sur le disque. On réactive l'audio et on
+  // reflète ce total, sans le recréditer.
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
@@ -956,23 +841,20 @@ export function Ps4Home({
         subtitle: `${known.title} · ${formatPlaytime(seconds)}`,
       });
 
-      // Affichage immédiat, puis liste faisant foi une fois écrite sur disque.
+      // Le back a déjà écrit le total sur le disque : on affiche ce total sans
+      // le recréditer, sinon la durée serait comptée deux fois.
+      const total = Math.max(
+        known.playtime_seconds ?? 0,
+        Math.round(payload.totalPlaytimeSeconds ?? 0),
+      );
       setLiveGames({
         ...liveGamesRef.current,
         [payload.gameId]: {
           ...known,
-          playtime_seconds: (known.playtime_seconds ?? 0) + seconds,
+          playtime_seconds: total,
+          last_played: payload.lastPlayed ?? known.last_played,
         },
       });
-
-      void invoke<Game[]>("add_playtime", { gameId: payload.gameId, seconds })
-        .then((list) => {
-          if (disposed) return;
-          setLiveGames(Object.fromEntries(list.map((game) => [game.id, game])));
-        })
-        .catch((cause) =>
-          console.error("Enregistrement du temps de jeu:", cause),
-        );
     };
 
     listen<GameSessionEnded>("game-session-ended", (event) =>
@@ -990,23 +872,24 @@ export function Ps4Home({
     };
   }, []);
 
-  // À la fermeture du jeu, on synchronise les trophées : le back croise les
-  // fichiers locaux et le compte Steam, puis signale les nouveautés.
+  // Le back synchronise les trophées (fin de session, ajout de jeu, démarrage)
+  // et publie le rapport complet : l'accueil rafraîchit compteurs et file de
+  // notifications sans refaire d'appels réseau.
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
-    const syncTrophies = async (gameId: string) => {
-      const game = displayGamesRef.current.find((item) => item.id === gameId);
-      if (!game?.steam_appid) return;
-      try {
-        const report = await invoke<TrophyReport>("get_game_trophies", {
-          steamAppid: game.steam_appid,
-          markNew: true,
-        });
+    listen<{ gameId: string; report: TrophyReport }>(
+      "trophies-updated",
+      (event) => {
         if (disposed) return;
-        setReports((previous) => ({ ...previous, [gameId]: report }));
-        const fresh = report.new_trophies ?? [];
+        const payload = event.payload;
+        if (!payload?.gameId || !payload.report) return;
+        setReports((previous) => ({
+          ...previous,
+          [payload.gameId]: payload.report,
+        }));
+        const fresh = payload.report.new_trophies ?? [];
         if (fresh.length > 0) {
           setTrophyQueue((previous) => [
             ...previous,
@@ -1018,19 +901,13 @@ export function Ps4Home({
             })),
           ]);
         }
-      } catch (cause) {
-        console.error("Synchronisation des trophées:", cause);
-      }
-    };
-
-    listen<string>("game-closed", (event) => {
-      if (typeof event.payload === "string") void syncTrophies(event.payload);
-    })
+      },
+    )
       .then((stop) => {
         if (disposed) stop();
         else unlisten = stop;
       })
-      .catch((cause) => console.error("Écoute game-closed:", cause));
+      .catch((cause) => console.error("Écoute trophies-updated:", cause));
 
     return () => {
       disposed = true;
@@ -1062,12 +939,13 @@ export function Ps4Home({
   const selectedId = selected?.id ?? null;
   const selectedBackground = selected?.bg_url ?? null;
   const isOccludedByGameBg = Boolean(selectedBackground);
-  const selectedReport = selected ? (reports[selected.id] ?? null) : null;
-  const selectedLaunchArgs = (selected?.launch_options ?? "").trim();
+
   // Tuile permanente : aucune action de modification ni de suppression.
   const selectedIsStore = isStoreGame(selected);
   const selectedIsLibrary = isLibraryGame(selected);
   const selectedIsPermanent = isPermanentTile(selected);
+  const selectedReport = selected ? (reports[selected.id] ?? null) : null;
+  const selectedLaunchArgs = (selected?.launch_options ?? "").trim();
   const confirming =
     selected !== null && !selectedIsPermanent && pendingDeleteId === selected.id;
   const canOpenTrophies = selected !== null && selected.steam_appid !== null;
@@ -1670,6 +1548,7 @@ export function Ps4Home({
   function openTrophies() {
     if (!canOpenTrophies) return;
     playEnterMenu();
+    setTrophiesTarget(null);
     setTrophiesOpen(true);
   }
 
@@ -1681,6 +1560,12 @@ export function Ps4Home({
   function focusHeader(index: number) {
     headerIndexRef.current = index;
     setHeaderIndex(index);
+  }
+
+  /** Survol de la barre de fonctions : ignoré hors mode souris. */
+  function hoverHeader(index: number) {
+    if (getInputMode() !== "mouse") return;
+    focusHeader(index);
   }
 
   function moveHeader(delta: number) {
@@ -1903,6 +1788,8 @@ export function Ps4Home({
           effectsVolume: current.effectsVolume + direction * 0.05,
         }),
       );
+      // Aperçu immédiat : on entend le nouveau niveau à chaque cran.
+      previewEffectsVolume();
     } else if (row === 3) {
       toggleNormalization();
       return;
@@ -1946,13 +1833,6 @@ export function Ps4Home({
     }
     // Croix pousse aussi les curseurs, comme la croix directionnelle.
     adjustAudioRow(1);
-  }
-
-  /** Halo de focus « Liquid Glass » sur le contrôle actif. */
-  function audioSectionClass(index: number) {
-    return index === audioIndex
-      ? "border-sky-300/40 bg-sky-400/[0.12] shadow-[0_0_0_1px_rgba(125,211,252,0.25),0_0_20px_rgba(0,114,206,0.35)]"
-      : "border-sky-300/10 bg-[#041029]/30 hover:border-sky-300/25 hover:bg-[#0f347a]/40";
   }
 
   function setAudioBand(band: "low" | "mid" | "high", value: number) {
@@ -2190,7 +2070,10 @@ export function Ps4Home({
     // tout de suite pour que stopThemeAudio ne relance pas la musique du menu.
     launchingGameRef.current = game;
     setLaunchingGame(game);
+    // Le son de démarrage du splash reste le dernier autorisé : le verrou
+    // audio central se ferme ensuite, avant même le prochain rendu React.
     playGameStart();
+    setGameAudioBlocked(true);
     pauseBgm();
     stopThemeAudio();
   }
@@ -2370,6 +2253,7 @@ export function Ps4Home({
    * pointeur immobile (il atterrissait alors sur « Supprimer du launcher »).
    */
   function focusDrawerFromPointer(next: DrawerFocus) {
+    if (getInputMode() !== "mouse") return;
     if (drawerFocusRef.current === next) return;
     drawerFocusRef.current = next;
     setDrawerFocus(next);
@@ -2756,17 +2640,20 @@ export function Ps4Home({
         <div className="ps4-vignette absolute inset-0" />
       </div>
 
-      {/* Mise à jour système : bandeau PS4 en haut à gauche, affiché jusqu'au
-          clic. Le son système accompagne son apparition. */}
+      {/* Mise à jour système : bandeau PS4 en haut à gauche. L'installation
+          démarre seule ; le clic ne sert qu'à réessayer après un échec. */}
       {systemUpdate ? (
         <div className="absolute left-0 top-8 z-[55] w-[21rem]" style={SST_STYLE}>
           <button
             type="button"
-            onClick={() => void installSystemUpdate()}
+            onClick={(event) => {
+              if (shouldIgnoreClick(event)) return;
+              void installSystemUpdate();
+            }}
             disabled={installingUpdate}
             title={
               updateError ??
-              "Mise à jour du logiciel système disponible — Cliquez pour installer"
+              "Mise à jour du logiciel système — installation automatique"
             }
             className="pointer-events-auto relative flex w-full items-center gap-3 rounded-r-xl bg-[#101828]/90 py-3 pl-5 pr-6 text-left shadow-[0_18px_40px_rgba(0,0,0,0.55)] backdrop-blur-md transition hover:bg-[#1b2b4b]/90 disabled:cursor-default"
           >
@@ -2800,7 +2687,7 @@ export function Ps4Home({
                   ? "Échec de l'installation — cliquez pour réessayer"
                   : installingUpdate
                     ? "Installation en cours…"
-                    : "Cliquez pour installer"}
+                    : "Téléchargement automatique…"}
               </span>
             </span>
           </button>
@@ -2813,8 +2700,11 @@ export function Ps4Home({
           <div className="ps4-top-left">
             <button
               type="button"
-              onClick={openTrophies}
-              onMouseEnter={() => focusHeader(0)}
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
+                openTrophies();
+              }}
+              onMouseEnter={() => hoverHeader(0)}
               onFocus={() => focusHeader(0)}
               disabled={!canOpenTrophies}
               title={
@@ -2835,8 +2725,11 @@ export function Ps4Home({
 
             <button
               type="button"
-              onClick={addGame}
-              onMouseEnter={() => focusHeader(1)}
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
+                addGame();
+              }}
+              onMouseEnter={() => hoverHeader(1)}
               onFocus={() => focusHeader(1)}
               disabled={busy}
               style={{ transition: HEADER_TRANSITION }}
@@ -2862,8 +2755,11 @@ export function Ps4Home({
           <div className="ps4-top-right">
             <button
               type="button"
-              onClick={openProfile}
-              onMouseEnter={() => focusHeader(2)}
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
+                openProfile();
+              }}
+              onMouseEnter={() => hoverHeader(2)}
               onFocus={() => focusHeader(2)}
               title={
                 profile
@@ -2900,8 +2796,11 @@ export function Ps4Home({
 
             <button
               type="button"
-              onClick={openAudio}
-              onMouseEnter={() => focusHeader(3)}
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
+                openAudio();
+              }}
+              onMouseEnter={() => hoverHeader(3)}
               onFocus={() => focusHeader(3)}
               title="Paramètres audio et égaliseur"
               aria-label="Paramètres audio et égaliseur"
@@ -2938,8 +2837,11 @@ export function Ps4Home({
 
             <button
               type="button"
-              onClick={() => void quitApplication()}
-              onMouseEnter={() => focusHeader(4)}
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
+                void quitApplication();
+              }}
+              onMouseEnter={() => hoverHeader(4)}
               onFocus={() => focusHeader(4)}
               title="Alimentation"
               aria-label="Alimentation"
@@ -2990,7 +2892,10 @@ export function Ps4Home({
                     ref={(element) => {
                       tileRefs.current[index] = element;
                     }}
-                    onClick={() => selectGame(index)}
+                    onClick={(event) => {
+                      if (shouldIgnoreClick(event)) return;
+                      selectGame(index);
+                    }}
                     aria-label={
                       isPermanentTile(game)
                         ? `Ouvrir ${game.title}`
@@ -3063,7 +2968,10 @@ export function Ps4Home({
               >
                 <button
                   type="button"
-                  onClick={launchSelected}
+                  onClick={(event) => {
+                    if (shouldIgnoreClick(event)) return;
+                    launchSelected();
+                  }}
                   disabled={busy || !selected}
                   className="ps4-start"
                 >
@@ -3107,7 +3015,10 @@ export function Ps4Home({
                   </div>
                   <button
                     type="button"
-                    onClick={backToRibbon}
+                    onClick={(event) => {
+                      if (shouldIgnoreClick(event)) return;
+                      backToRibbon();
+                    }}
                     className="ps4-back"
                   >
                     <img
@@ -3143,7 +3054,10 @@ export function Ps4Home({
                     </div>
                     <button
                       type="button"
-                      onClick={launchSelected}
+                      onClick={(event) => {
+                        if (shouldIgnoreClick(event)) return;
+                        launchSelected();
+                      }}
                       onPointerMove={() => focusDrawerFromPointer("start")}
                       disabled={busy}
                       className={`ps4-info-start ${
@@ -3155,7 +3069,6 @@ export function Ps4Home({
                   </div>
 
                   <div className="ps4-info-details">
-                    <>
                     <div className="ps4-playtime">
                       <svg
                         viewBox="0 0 24 24"
@@ -3180,7 +3093,10 @@ export function Ps4Home({
 
                     <button
                       type="button"
-                      onClick={openTrophies}
+                      onClick={(event) => {
+                        if (shouldIgnoreClick(event)) return;
+                        openTrophies();
+                      }}
                       onPointerMove={() => focusDrawerFromPointer("trophies")}
                       disabled={!canOpenTrophies}
                       className={`ps4-trophy-panel ${
@@ -3233,7 +3149,10 @@ export function Ps4Home({
 
                     <button
                       type="button"
-                      onClick={() => openLaunchOptions()}
+                      onClick={(event) => {
+                        if (shouldIgnoreClick(event)) return;
+                        openLaunchOptions();
+                      }}
                       onPointerMove={() =>
                         focusDrawerFromPointer("launch_options")
                       }
@@ -3282,7 +3201,10 @@ export function Ps4Home({
                     <div className="ps4-info-actions">
                       <button
                         type="button"
-                        onClick={refreshArtwork}
+                        onClick={(event) => {
+                          if (shouldIgnoreClick(event)) return;
+                          void refreshArtwork();
+                        }}
                         onPointerMove={() =>
                           focusDrawerFromPointer("refresh_art")
                         }
@@ -3298,7 +3220,10 @@ export function Ps4Home({
 
                       <button
                         type="button"
-                        onClick={togglePin}
+                        onClick={(event) => {
+                          if (shouldIgnoreClick(event)) return;
+                          togglePin();
+                        }}
                         onPointerMove={() => focusDrawerFromPointer("pin_game")}
                         disabled={busy}
                         className={`ps4-info-action ${
@@ -3315,7 +3240,10 @@ export function Ps4Home({
                           <span>Supprimer ?</span>
                           <button
                             type="button"
-                            onClick={confirmDelete}
+                            onClick={(event) => {
+                              if (shouldIgnoreClick(event)) return;
+                              confirmDelete();
+                            }}
                             disabled={busy}
                             className="ps4-info-action is-danger"
                           >
@@ -3323,7 +3251,10 @@ export function Ps4Home({
                           </button>
                           <button
                             type="button"
-                            onClick={cancelDelete}
+                            onClick={(event) => {
+                              if (shouldIgnoreClick(event)) return;
+                              cancelDelete();
+                            }}
                             className="ps4-info-action"
                           >
                             Non
@@ -3332,7 +3263,10 @@ export function Ps4Home({
                       ) : (
                         <button
                           type="button"
-                          onClick={requestDelete}
+                          onClick={(event) => {
+                            if (shouldIgnoreClick(event)) return;
+                            requestDelete();
+                          }}
                           onPointerMove={() =>
                             focusDrawerFromPointer("remove_game")
                           }
@@ -3347,7 +3281,6 @@ export function Ps4Home({
                         </button>
                       )}
                     </div>
-                      </>
                   </div>
                 </div>
               </div>
@@ -3459,335 +3392,32 @@ export function Ps4Home({
         ) : null}
       </div>
 
-      {audioOpen ? (
-        <div
-          className="fixed inset-0 z-[80] flex items-center justify-center bg-[#010817]/70 p-4 backdrop-blur-[2px]"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="audio-title"
-          onClick={(event) => {
-            if (event.target === event.currentTarget) closeAudio();
-          }}
-        >
-          <div
-            style={SST_STYLE}
-            className="max-h-[92vh] w-[410px] max-w-[90vw] overflow-y-auto rounded-[22px] border border-sky-400/25 bg-gradient-to-b from-[#0b2a66]/90 via-[#071b44]/92 to-[#041029]/95 p-4 text-sky-50 shadow-[0_20px_50px_rgba(0,12,36,0.85),inset_0_1px_1px_rgba(125,211,252,0.3)] backdrop-blur-2xl"
-          >
-            <div className="flex items-start justify-between gap-2.5">
-              <div>
-                <h2
-                  id="audio-title"
-                  style={SST_STYLE}
-                  className="text-sm font-semibold leading-tight tracking-[-0.01em]"
-                >
-                  Paramètres audio
-                </h2>
-                <p
-                  style={SST_STYLE}
-                  className="mt-0.5 text-xs text-sky-200/55"
-                >
-                  Égaliseur · aperçu en direct
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={closeAudio}
-                aria-label="Fermer les paramètres audio"
-                style={SST_STYLE}
-                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-sky-300/25 bg-sky-400/10 text-sky-100/70 transition-all duration-200 ease-out hover:bg-sky-400/20 hover:text-white"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  className="h-3 w-3"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  aria-hidden="true"
-                >
-                  <path d="M6 6l12 12M18 6L6 18" />
-                </svg>
-              </button>
-            </div>
-
-            <div className="mt-3 rounded-2xl border border-sky-300/15 bg-[#0f347a]/35 p-3 shadow-[inset_0_1px_1px_rgba(125,211,252,0.18)]">
-              <h3
-                style={SST_STYLE}
-                className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-sky-200/45"
-              >
-                Niveaux généraux
-              </h3>
-
-              <div className="space-y-2.5">
-                <div
-                  role="switch"
-                  aria-checked={!bgmMuted}
-                  tabIndex={-1}
-                  onMouseEnter={() => focusAudioRow(0)}
-                  onClick={() => {
-                    focusAudioRow(0);
-                    toggleBgm();
-                  }}
-                  style={SST_STYLE}
-                  className={`flex cursor-pointer items-center justify-between gap-2.5 rounded-xl border px-2.5 py-1.5 outline-none transition-all duration-200 ease-out ${audioSectionClass(0)}`}
-                >
-                  <span style={SST_STYLE} className="text-sm text-sky-50/85">
-                    Muet
-                  </span>
-                  <span
-                    aria-hidden="true"
-                    className={`relative h-6 w-10 shrink-0 rounded-full border transition-all duration-200 ease-out ${
-                      bgmMuted
-                        ? "border-sky-300/20 bg-[#05173a]/80"
-                        : "border-sky-200/40 bg-gradient-to-r from-[#0072ce] to-[#00a2ff] shadow-[0_0_10px_rgba(0,162,255,0.45)]"
-                    }`}
-                  >
-                    <span
-                      className={`absolute top-0.5 h-5 w-5 rounded-full bg-gradient-to-b from-white to-sky-100 shadow-[0_1px_3px_rgba(0,12,36,0.45)] transition-transform duration-200 ease-out ${
-                        bgmMuted ? "translate-x-0.5" : "translate-x-[18px]"
-                      }`}
-                    />
-                  </span>
-                </div>
-
-                <div
-                  onMouseEnter={() => focusAudioRow(1)}
-                  onClick={() => focusAudioRow(1)}
-                  style={SST_STYLE}
-                  className={`rounded-xl border px-2.5 py-1.5 transition-all duration-200 ease-out ${audioSectionClass(1)}`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span
-                      style={SST_STYLE}
-                      className="text-xs text-sky-100/70"
-                    >
-                      Musique de thème
-                    </span>
-                    <span
-                      style={SST_STYLE}
-                      className="text-xs tabular-nums text-sky-200/60"
-                    >
-                      {Math.round(audioSettings.themeVolume * 100)} %
-                    </span>
-                  </div>
-                  <div className="mt-1.5 flex items-center">
-                    <GlassSlider
-                      label="Volume de la musique de thème"
-                      value={Math.round(audioSettings.themeVolume * 100)}
-                      onFocus={() => focusAudioRow(1)}
-                      onChange={(value) => {
-                        setAudioSettingsState(
-                          updateAudioSettings({ themeVolume: value / 100 }),
-                        );
-                      }}
-                    />
-                  </div>
-                </div>
-
-                <div
-                  onMouseEnter={() => focusAudioRow(2)}
-                  onClick={() => focusAudioRow(2)}
-                  style={SST_STYLE}
-                  className={`rounded-xl border px-2.5 py-1.5 transition-all duration-200 ease-out ${audioSectionClass(2)}`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span
-                      style={SST_STYLE}
-                      className="text-xs text-sky-100/70"
-                    >
-                      Effets système
-                    </span>
-                    <span
-                      style={SST_STYLE}
-                      className="text-xs tabular-nums text-sky-200/60"
-                    >
-                      {Math.round(audioSettings.effectsVolume * 100)} %
-                    </span>
-                  </div>
-                  <div className="mt-1.5 flex items-center">
-                    <GlassSlider
-                      label="Volume des effets système"
-                      value={Math.round(audioSettings.effectsVolume * 100)}
-                      onFocus={() => focusAudioRow(2)}
-                      onChange={(value) => {
-                        setAudioSettingsState(
-                          updateAudioSettings({ effectsVolume: value / 100 }),
-                        );
-                      }}
-                    />
-                  </div>
-                </div>
-
-                <div
-                  role="switch"
-                  aria-checked={audioSettings.normalization}
-                  tabIndex={-1}
-                  onMouseEnter={() => focusAudioRow(3)}
-                  onClick={() => {
-                    focusAudioRow(3);
-                    toggleNormalization();
-                  }}
-                  style={SST_STYLE}
-                  className={`flex cursor-pointer items-center justify-between gap-2.5 rounded-xl border px-2.5 py-1.5 outline-none transition-all duration-200 ease-out ${audioSectionClass(3)}`}
-                >
-                  <span
-                    style={SST_STYLE}
-                    className="text-sm text-sky-50/85"
-                  >
-                    Normalisation auto
-                  </span>
-                  <span
-                    aria-hidden="true"
-                    className={`relative h-6 w-10 shrink-0 rounded-full border transition-all duration-200 ease-out ${
-                      audioSettings.normalization
-                        ? "border-sky-200/40 bg-gradient-to-r from-[#0072ce] to-[#00a2ff] shadow-[0_0_10px_rgba(0,162,255,0.45)]"
-                        : "border-sky-300/20 bg-[#05173a]/80"
-                    }`}
-                  >
-                    <span
-                      className={`absolute top-0.5 h-5 w-5 rounded-full bg-gradient-to-b from-white to-sky-100 shadow-[0_1px_3px_rgba(0,12,36,0.45)] transition-transform duration-200 ease-out ${
-                        audioSettings.normalization
-                          ? "translate-x-[18px]"
-                          : "translate-x-0.5"
-                      }`}
-                    />
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-2.5 rounded-2xl border border-sky-300/15 bg-[#0f347a]/35 p-3 shadow-[inset_0_1px_1px_rgba(125,211,252,0.18)]">
-              <div className="flex items-center justify-between gap-2">
-                <h3
-                  style={SST_STYLE}
-                  className="text-xs font-semibold uppercase tracking-[0.16em] text-sky-200/45"
-                >
-                  Égaliseur
-                </h3>
-                <span
-                  style={SST_STYLE}
-                  className="text-xs text-sky-200/35"
-                >
-                  3 bandes
-                </span>
-              </div>
-
-              <div
-                onMouseEnter={() => focusAudioRow(4)}
-                onClick={() => focusAudioRow(4)}
-                style={SST_STYLE}
-                className={`mt-2 flex gap-0.5 rounded-full border p-0.5 transition-all duration-200 ease-out ${
-                  audioIndex === 4
-                    ? "border-sky-300/40 bg-[#0f347a]/70 shadow-[0_0_0_1px_rgba(125,211,252,0.25),0_0_18px_rgba(0,114,206,0.35)]"
-                    : "border-sky-300/15 bg-[#041029]/45"
-                }`}
-              >
-                {EQ_PRESETS.map((preset) => {
-                  const active =
-                    audioSettings.eqLow === preset.low &&
-                    audioSettings.eqMid === preset.mid &&
-                    audioSettings.eqHigh === preset.high;
-                  return (
-                    <button
-                      key={preset.id}
-                      type="button"
-                      onClick={() => {
-                        focusAudioRow(4);
-                        setAudioSettingsState(applyEqPreset(preset.id));
-                        playNav();
-                      }}
-                      onMouseEnter={() => focusAudioRow(4)}
-                      style={SST_STYLE}
-                      className={`flex-1 rounded-full px-1.5 py-1 text-xs font-medium transition-all duration-200 ease-out ${
-                        active
-                          ? "bg-gradient-to-b from-sky-300/35 via-sky-400/20 to-sky-500/15 text-white shadow-[inset_0_1px_1px_rgba(186,230,253,0.5)]"
-                          : "text-sky-100/60 hover:text-white"
-                      }`}
-                    >
-                      {preset.id === "deep" ? "Basses +" : preset.label}
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div className="mt-3 flex items-start justify-around gap-1.5">
-                {(
-                  [
-                    {
-                      index: 5,
-                      band: "low",
-                      label: "Basses",
-                      freq: "120 Hz",
-                      value: audioSettings.eqLow,
-                    },
-                    {
-                      index: 6,
-                      band: "mid",
-                      label: "Médiums",
-                      freq: "1 kHz",
-                      value: audioSettings.eqMid,
-                    },
-                    {
-                      index: 7,
-                      band: "high",
-                      label: "Aigus",
-                      freq: "8 kHz",
-                      value: audioSettings.eqHigh,
-                    },
-                  ] as const
-                ).map((band) => (
-                  <div
-                    key={band.band}
-                    className="flex w-20 flex-col items-center"
-                    onMouseEnter={() => focusAudioRow(band.index)}
-                  >
-                    <span
-                      style={SST_STYLE}
-                      className="mb-1 text-xs tabular-nums text-sky-100/80"
-                    >
-                      {band.value > 0 ? `+${band.value}` : band.value} dB
-                    </span>
-                    <GlassFader
-                      label={`${band.label} ${band.freq}`}
-                      value={band.value}
-                      active={audioIndex === band.index}
-                      onFocus={() => focusAudioRow(band.index)}
-                      onChange={(value) => setAudioBand(band.band, value)}
-                    />
-                    <span
-                      style={SST_STYLE}
-                      className="mt-1.5 text-xs text-sky-50/85"
-                    >
-                      {band.label}
-                    </span>
-                    <span
-                      style={SST_STYLE}
-                      className="text-xs text-sky-200/40"
-                    >
-                      {band.freq}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="mt-3 flex items-center justify-between gap-2 text-xs text-sky-200/40">
-              <span style={SST_STYLE}>↑↓ · ←→ · glisser</span>
-              <span
-                style={SST_STYLE}
-                className="flex items-center gap-1.5"
-              >
-                <img
-                  src="/buttons/PS4_Circle.png"
-                  alt=""
-                  className="h-3.5 w-3.5 object-contain opacity-80"
-                />
-                Fermer
-              </span>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <AudioSettingsModal
+        open={audioOpen}
+        index={audioIndex}
+        settings={audioSettings}
+        muted={bgmMuted}
+        onClose={closeAudio}
+        onFocusRow={focusAudioRow}
+        onToggleMute={toggleBgm}
+        onToggleNormalization={toggleNormalization}
+        onThemeVolume={(value) =>
+          setAudioSettingsState(
+            updateAudioSettings({ themeVolume: value / 100 }),
+          )
+        }
+        onEffectsVolume={(value) =>
+          setAudioSettingsState(
+            updateAudioSettings({ effectsVolume: value / 100 }),
+          )
+        }
+        onPreset={(id) => {
+          focusAudioRow(4);
+          setAudioSettingsState(applyEqPreset(id));
+          playNav();
+        }}
+        onBand={setAudioBand}
+      />
 
       {libraryOpen ? (
         <Ps4LibraryView
@@ -3807,6 +3437,7 @@ export function Ps4Home({
           aria-modal="true"
           aria-labelledby="launch-options-title"
           onClick={(event) => {
+            if (shouldIgnoreClick(event)) return;
             if (event.target === event.currentTarget) closeLaunchOptions();
           }}
         >
@@ -3882,7 +3513,10 @@ export function Ps4Home({
                     setOptionsCursor(-1);
                     event.currentTarget.select();
                   }}
-                  onClick={(event) => event.currentTarget.select()}
+                  onClick={(event) => {
+                    if (shouldIgnoreClick(event)) return;
+                    event.currentTarget.select();
+                  }}
                   onKeyDown={(event) => {
                     // Champ en lecture seule : les flèches et ZQSD relancent
                     // aussitôt la navigation au lieu d'y rester bloquées.
@@ -3908,7 +3542,10 @@ export function Ps4Home({
                 <button
                   ref={optionsCopyRef}
                   type="button"
-                  onClick={() => void copyGamePath()}
+                  onClick={(event) => {
+                    if (shouldIgnoreClick(event)) return;
+                    void copyGamePath();
+                  }}
                   onFocus={() => setOptionsCursor(1)}
                   disabled={!optionsGame.exe_path}
                   className={`min-w-[calc(150*var(--u))] shrink-0 border-[3px] px-[calc(20*var(--u))] py-[calc(10*var(--u))] text-[calc(24*var(--u))] outline-none transition disabled:opacity-40 ${
@@ -3930,7 +3567,10 @@ export function Ps4Home({
               <button
                 ref={optionsSaveRef}
                 type="button"
-                onClick={() => saveOptionsRef.current()}
+                onClick={(event) => {
+                  if (shouldIgnoreClick(event)) return;
+                  saveOptionsRef.current();
+                }}
                 onFocus={() => setOptionsCursor(2)}
                 disabled={savingOptions}
                 className={`flex items-center gap-[calc(12*var(--u))] border-[3px] px-[calc(28*var(--u))] py-[calc(12*var(--u))] text-[calc(26*var(--u))] outline-none transition disabled:opacity-50 ${
@@ -3950,7 +3590,10 @@ export function Ps4Home({
               <button
                 ref={optionsCancelRef}
                 type="button"
-                onClick={closeLaunchOptions}
+                onClick={(event) => {
+                  if (shouldIgnoreClick(event)) return;
+                  closeLaunchOptions();
+                }}
                 onFocus={() => setOptionsCursor(3)}
                 className={`flex items-center gap-[calc(12*var(--u))] border-[3px] px-[calc(28*var(--u))] py-[calc(12*var(--u))] text-[calc(26*var(--u))] outline-none transition ${
                   optionsCursor === 3
@@ -3969,7 +3612,10 @@ export function Ps4Home({
               <button
                 ref={optionsRegenRef}
                 type="button"
-                onClick={() => void regenerateTheme()}
+                onClick={(event) => {
+                  if (shouldIgnoreClick(event)) return;
+                  void regenerateTheme();
+                }}
                 onFocus={() => setOptionsCursor(4)}
                 disabled={savingOptions || regeneratingTheme || deletingTheme}
                 className={`ml-auto flex items-center border-[3px] px-[calc(22*var(--u))] py-[calc(10*var(--u))] text-[calc(22*var(--u))] outline-none transition disabled:opacity-40 ${
@@ -3987,7 +3633,10 @@ export function Ps4Home({
                 <button
                   ref={optionsDeleteRef}
                   type="button"
-                  onClick={() => void deleteTheme()}
+                  onClick={(event) => {
+                    if (shouldIgnoreClick(event)) return;
+                    void deleteTheme();
+                  }}
                   onFocus={() => setOptionsCursor(5)}
                   disabled={savingOptions || regeneratingTheme || deletingTheme}
                   className={`flex items-center border-[3px] px-[calc(22*var(--u))] py-[calc(10*var(--u))] text-[calc(22*var(--u))] outline-none transition disabled:opacity-40 ${
@@ -4046,12 +3695,13 @@ export function Ps4Home({
         </div>
       ) : null}
 
-      {trophiesOpen && selected ? (
+      {trophiesOpen && (trophiesTarget ?? selected) ? (
         <TrophyModal
-          game={selected}
+          game={(trophiesTarget ?? selected)!}
           onClose={() => {
             setModalGuard(true);
             setTrophiesOpen(false);
+            setTrophiesTarget(null);
           }}
         />
       ) : null}

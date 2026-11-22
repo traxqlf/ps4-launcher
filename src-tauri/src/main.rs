@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    ps4_launcher_lib::run()
+    pulse_ps4_lib::run()
 }

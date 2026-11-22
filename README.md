@@ -1,4 +1,4 @@
-# 🎮 PS4 PC Game Launcher (Tutorial in English below🇬🇧)
+# 🎮 PulsePS4 (Tutorial in English below🇬🇧)
 
 Un launcher de jeux PC moderne, fluide et ultra-léger développé avec **Tauri v2**, **Rust** et **React**, reproduisant fidèlement l'interface dynamique **Orbis OS** de la PlayStation 4.
 
@@ -54,7 +54,7 @@ Pour compiler et exécuter ce projet depuis le code source :
 
 
 
-# 🎮 PS4 PC Game Launcher (English🇬🇧)
+# 🎮 PulsePS4 (English🇬🇧)
 
 A modern, smooth, and ultra-lightweight PC game launcher built with **Tauri v2**, **Rust**, and **React**, faithfully recreating the PlayStation 4 **Orbis OS** dynamic menu.
 

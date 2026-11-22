@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ps4-launcher",
-  "version": "0.1.1",
+  "productName": "PulsePS4",
+  "version": "1.0.1",
   "identifier": "com.thibault.ps4-launcher",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "ps4-launcher",
+        "title": "PulsePS4",
         "width": 800,
         "height": 600,
         "resizable": true,
@@ -47,6 +47,9 @@
   },
   "plugins": {
     "updater": {
+      "windows": {
+        "installMode": "quiet"
+      },
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNDMkVBNkM2OUEwQTk2N0YKUldSL2xncWF4cVl1UEZURUQzSUlRUVBwd3oxeHZzL2tHOFdwTXBEZGRickVCeEthK0tqWCt0ZGkK",
       "endpoints": [
         "https://github.com/traxqlf/ps4-launcher/releases/latest/download/latest.json"

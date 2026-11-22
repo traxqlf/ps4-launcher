@@ -17,7 +17,13 @@ export interface GamepadHandlers {
 
 type Direction = "up" | "down" | "left" | "right";
 
+export type InputMode = "mouse" | "gamepad";
+
 const COOLDOWN_MS = 180;
+// Seuil de réveil manette : tout bouton ou stick qui dépasse ces valeurs
+// rebascule l'interface en mode manette (curseur masqué).
+const ACTIVITY_BUTTON = 0.1;
+const ACTIVITY_AXIS = 0.25;
 const STICK_DEADZONE = 0.6;
 const DPAD_UP = 12;
 const DPAD_DOWN = 13;
@@ -78,6 +84,11 @@ export interface GamepadOptions {
 }
 
 let globalInputLocked = false;
+// Deux causes distinctes de suspension, combinées en un seul drapeau : une
+// session de jeu (splash puis partie) et une fenêtre en arrière-plan (pilotée
+// par le verrou audio `useAudioGate`).
+let gamepadGameSuspended = false;
+let gamepadBackgroundSuspended = false;
 let gamepadSuspended = false;
 
 /** Bloque les hooks globaux pendant qu'une zone locale navigue. */
@@ -85,15 +96,95 @@ export function setGlobalGamepadLock(locked: boolean) {
   globalInputLocked = locked;
 }
 
+// Mode d'entrée global : la manette masque le curseur, la souris le restaure.
+let inputMode: InputMode = "mouse";
+
+export function getInputMode(): InputMode {
+  return inputMode;
+}
+
+/** Applique le mode d'entrée et la classe CSS qui masque / restaure le pointeur. */
+export function setInputMode(mode: InputMode) {
+  if (inputMode === mode) return;
+  inputMode = mode;
+  if (typeof document !== "undefined") {
+    const gamepadMode = mode === "gamepad";
+    document.documentElement.classList.toggle("input-mode-gamepad", gamepadMode);
+    document.body?.classList.toggle("input-mode-gamepad", gamepadMode);
+  }
+}
+
+/**
+ * Vrai quand un clic doit être ignoré : en mode manette, seul le clic réel
+ * d'une souris (`detail > 0`) est bloqué, afin qu'aucune action ni bruitage ne
+ * parte de l'élément situé sous le pointeur invisible. L'activation clavier
+ * (`detail === 0`) et l'activation programmée par la manette
+ * (`element.click()`, également `detail === 0`) restent opérationnelles.
+ */
+export function shouldIgnoreClick(event: { detail: number }): boolean {
+  return inputMode !== "mouse" && event.detail > 0;
+}
+
+// Référence native capturée avant les masquages locaux (panneau d'options) :
+// la détection du mode manette doit continuer à voir la vraie manette.
+const nativeGetGamepads =
+  typeof navigator !== "undefined" && typeof navigator.getGamepads === "function"
+    ? navigator.getGamepads.bind(navigator)
+    : null;
+
+/** Vrai dès qu'un bouton est pressé ou qu'un stick dépasse la zone morte. */
+function gamepadActivity(): boolean {
+  for (const pad of nativeGetGamepads?.() ?? []) {
+    if (!pad?.connected) continue;
+    if (
+      pad.buttons.some(
+        (button) => button.pressed || button.value > ACTIVITY_BUTTON,
+      )
+    ) {
+      return true;
+    }
+    if (pad.axes.some((axis) => Math.abs(axis) > ACTIVITY_AXIS)) return true;
+  }
+  return false;
+}
+
 // Une session de jeu arrête complètement le polling : plus aucune boucle
 // requestAnimationFrame ne tourne tant que le launcher est en arrière-plan.
 const suspensionListeners = new Set<(suspended: boolean) => void>();
 
+/** Prévient les écouteurs souris globaux des suspensions de la boucle manette. */
+export function subscribeGamepadSuspension(
+  listener: (suspended: boolean) => void,
+): () => void {
+  suspensionListeners.add(listener);
+  return () => {
+    suspensionListeners.delete(listener);
+  };
+}
+
+function syncSuspension() {
+  const next = gamepadGameSuspended || gamepadBackgroundSuspended;
+  if (gamepadSuspended === next) return;
+  gamepadSuspended = next;
+  for (const listener of suspensionListeners) listener(next);
+}
+
 /** Suspend (ou relance) la boucle manette pendant une session de jeu. */
 export function setGamepadSuspended(suspended: boolean) {
-  if (gamepadSuspended === suspended) return;
-  gamepadSuspended = suspended;
-  for (const listener of suspensionListeners) listener(suspended);
+  if (gamepadGameSuspended === suspended) return;
+  gamepadGameSuspended = suspended;
+  syncSuspension();
+}
+
+/**
+ * Suspend la boucle manette quand la fenêtre passe en arrière-plan : plus aucun
+ * requestAnimationFrame ne tourne (0 % CPU launcher). La manette reste lue
+ * pendant le splash, la fenêtre étant alors au premier plan.
+ */
+export function setGamepadBackgroundSuspended(suspended: boolean) {
+  if (gamepadBackgroundSuspended === suspended) return;
+  gamepadBackgroundSuspended = suspended;
+  syncSuspension();
 }
 
 /** Vrai pendant une session de jeu : aucune entrée du launcher n'est lue. */
@@ -291,6 +382,9 @@ export function useGamepad(
         frame = 0;
         return;
       }
+      // Toute activité manette masque immédiatement le curseur, y compris
+      // pendant qu'une zone locale (modale, menu du haut) tient la navigation.
+      if (gamepadActivity()) setInputMode("gamepad");
       frame = requestAnimationFrame(tick);
 
       // Zone locale active : on garde les fronts à jour pour qu'un bouton

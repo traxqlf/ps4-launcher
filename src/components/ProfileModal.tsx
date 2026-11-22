@@ -19,6 +19,7 @@ import {
   hasSystemModifier,
   isMenuKey,
   isTypingTarget,
+  shouldIgnoreClick,
 } from "../hooks/useGamepad";
 import type { TrophyReport } from "./TrophyModal";
 import type { Game, UserProfile } from "../types";
@@ -158,8 +159,6 @@ export function ProfileModal({
     (sum, game) => sum + game.playtime_seconds,
     0,
   );
-  const progress =
-    summary && summary.total > 0 ? (summary.unlocked / summary.total) * 100 : 0;
   const appidKey = [
     ...new Set(
       games.flatMap((game) => (game.steam_appid ? [game.steam_appid] : [])),
@@ -563,7 +562,10 @@ export function ProfileModal({
           <time className="text-[24px] font-light tabular-nums">{clock}</time>
           <button
             type="button"
-            onClick={() => closeRef.current()}
+            onClick={(event) => {
+              if (shouldIgnoreClick(event)) return;
+              closeRef.current();
+            }}
             className="flex items-center gap-3 border-2 border-transparent px-4 py-2 text-[20px] text-white/80 transition hover:border-[3px] hover:border-white hover:bg-[#00439c]/60 hover:text-white hover:shadow-[0_0_22px_rgba(255,255,255,0.5)]"
           >
             <img src="/buttons/PS4_Circle.png" alt="" className={HINT_ICON} />
@@ -592,7 +594,10 @@ export function ProfileModal({
                     itemRefs.current[0] = element;
                   }}
                   type="button"
-                  onClick={changeAvatar}
+                  onClick={(event) => {
+                    if (shouldIgnoreClick(event)) return;
+                    changeAvatar();
+                  }}
                   disabled={uploading}
                   onFocus={() => setCursor(0)}
                   aria-label="Modifier l'avatar"
@@ -637,7 +642,10 @@ export function ProfileModal({
                 itemRefs.current[1] = element;
               }}
               type="button"
-              onClick={changeAvatar}
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
+                changeAvatar();
+              }}
               disabled={uploading}
               onFocus={() => setCursor(1)}
               className={`mt-7 w-full rounded-[2px] px-8 py-4 text-[22px] font-medium outline-none transition disabled:opacity-60 ${
@@ -659,7 +667,10 @@ export function ProfileModal({
                   value={username}
                   onChange={(event) => setUsername(event.target.value)}
                   onFocus={() => setCursor(2)}
-                  onClick={() => beginEdit("username", 2)}
+                  onClick={(event) => {
+                    if (shouldIgnoreClick(event)) return;
+                    beginEdit("username", 2);
+                  }}
                   onBlur={() => {
                     if (editingField === "username") setEditingField(null);
                   }}
@@ -684,7 +695,10 @@ export function ProfileModal({
                     value={sgdbKey}
                     onChange={(event) => setSgdbKey(event.target.value)}
                     onFocus={() => setCursor(3)}
-                    onClick={() => beginEdit("sgdb", 3)}
+                    onClick={(event) => {
+                      if (shouldIgnoreClick(event)) return;
+                      beginEdit("sgdb", 3);
+                    }}
                     onBlur={() => {
                       if (editingField === "sgdb") setEditingField(null);
                     }}
@@ -722,7 +736,10 @@ export function ProfileModal({
                     value={steamId}
                     onChange={(event) => setSteamId(event.target.value)}
                     onFocus={() => setCursor(4)}
-                    onClick={() => beginEdit("steamId", 4)}
+                    onClick={(event) => {
+                      if (shouldIgnoreClick(event)) return;
+                      beginEdit("steamId", 4);
+                    }}
                     onBlur={() => {
                       if (editingField === "steamId") setEditingField(null);
                     }}
@@ -750,7 +767,10 @@ export function ProfileModal({
                     value={steamKey}
                     onChange={(event) => setSteamKey(event.target.value)}
                     onFocus={() => setCursor(5)}
-                    onClick={() => beginEdit("steamKey", 5)}
+                    onClick={(event) => {
+                      if (shouldIgnoreClick(event)) return;
+                      beginEdit("steamKey", 5);
+                    }}
                     onBlur={() => {
                       if (editingField === "steamKey") setEditingField(null);
                     }}
@@ -780,7 +800,8 @@ export function ProfileModal({
                 itemRefs.current[6] = element;
               }}
               type="button"
-              onClick={() => {
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
                 saveProfileRef.current();
               }}
               disabled={saving}
@@ -803,21 +824,9 @@ export function ProfileModal({
 
           <div>
             <section className="border-b border-white/25 pb-9">
-              <div className="flex flex-wrap items-end justify-between gap-4">
-                <h2 className="text-[36px] font-light leading-none tracking-wide">
-                  Trophées
-                </h2>
-                <p className="text-[40px] font-light leading-none tabular-nums">
-                  {summary ? `${Math.round(progress)} %` : "…"}
-                </p>
-              </div>
-
-              <div className="mt-5 h-3 w-full bg-white/20">
-                <div
-                  className="h-full bg-white transition-[width] duration-500"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
+              <h2 className="text-[36px] font-light leading-none tracking-wide">
+                Trophées
+              </h2>
 
               <div className="mt-8 grid grid-cols-2 gap-x-8 gap-y-6 sm:grid-cols-4">
                 {TROPHY_ROWS.map((row) => (

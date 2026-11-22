@@ -6,7 +6,9 @@ import { AddGameModal } from "./components/AddGameModal";
 import { BootScreen } from "./components/BootScreen";
 import { Ps4Home } from "./components/Ps4Home";
 import { Ps4Notification, notify } from "./components/Ps4Notification";
+import { useAudioGate } from "./hooks/useAudioGate";
 import { useGamepad } from "./hooks/useGamepad";
+import { useInputModeTracking } from "./hooks/useInputMode";
 import {
   playBack,
   playDialogYes,
@@ -97,6 +99,11 @@ function App() {
   const [bootPhase, setBootPhase] = useState<BootPhase>("running");
   // Modale « Ajouter un jeu » : fichier seul ou dossier scanné.
   const [addOpen, setAddOpen] = useState(false);
+  // Verrou audio global : fenêtre au premier plan et hors session de jeu.
+  // Il couvre aussi l'écran de boot, monté avant Ps4Home.
+  useAudioGate();
+  // Bascule manette / souris : un seul jeu d'écouteurs souris pour l'application.
+  useInputModeTracking();
 
   useEffect(() => {
     // Purge d'abord les musiques dont la provenance n'est plus conforme ; les

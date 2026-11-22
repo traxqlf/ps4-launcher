@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { setGlobalGamepadLock } from "../hooks/useGamepad";
+import {
+  setGlobalGamepadLock,
+  shouldIgnoreClick,
+} from "../hooks/useGamepad";
 import { playBack, playConfirm, playError, playNav } from "../utils/ps4Audio";
 
 /**
@@ -306,7 +309,8 @@ export function AddGameModal({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-6 backdrop-blur-sm"
-      onClick={() => {
+      onClick={(event) => {
+        if (shouldIgnoreClick(event)) return;
         if (!busy) onClose();
       }}
     >
@@ -322,7 +326,10 @@ export function AddGameModal({
           <h2 className="text-lg font-bold tracking-wide">Ajouter un jeu</h2>
           <button
             type="button"
-            onClick={onClose}
+            onClick={(event) => {
+              if (shouldIgnoreClick(event)) return;
+              onClose();
+            }}
             disabled={busy}
             aria-label="Fermer"
             className="flex h-8 w-8 items-center justify-center rounded-full border border-white/20 text-white/70 transition hover:border-white/60 hover:text-white disabled:opacity-40"
@@ -346,7 +353,10 @@ export function AddGameModal({
             <button
               type="button"
               data-gp-focusable=""
-              onClick={onBrowse}
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
+                onBrowse();
+              }}
               disabled={busy}
               className="rounded-lg border border-white/20 px-4 py-2.5 text-sm font-medium outline-none transition hover:border-white/70 hover:bg-white/10 focus:border-white focus:bg-white/10 focus:ring-2 focus:ring-white/70 disabled:opacity-40"
             >
@@ -355,7 +365,10 @@ export function AddGameModal({
             <button
               type="button"
               data-gp-focusable=""
-              onClick={() => void scanDirectory()}
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
+                void scanDirectory();
+              }}
               disabled={busy || scanning}
               className="rounded-lg border border-white/60 bg-white/10 px-4 py-2.5 text-sm font-medium outline-none transition hover:bg-white/20 focus:border-white focus:bg-white/20 focus:ring-2 focus:ring-white/70 disabled:opacity-40"
             >
@@ -364,7 +377,10 @@ export function AddGameModal({
             <button
               type="button"
               data-gp-focusable=""
-              onClick={() => void detectInstalled()}
+              onClick={(event) => {
+                if (shouldIgnoreClick(event)) return;
+                void detectInstalled();
+              }}
               disabled={busy || scanning || detecting}
               className="rounded-lg border border-white/20 px-4 py-2.5 text-sm font-medium outline-none transition hover:border-white/70 hover:bg-white/10 focus:border-white focus:bg-white/10 focus:ring-2 focus:ring-white/70 disabled:opacity-40"
             >
@@ -388,15 +404,16 @@ export function AddGameModal({
                   type="button"
                   data-gp-focusable=""
                   disabled={busy}
-                  onClick={() =>
+                  onClick={(event) => {
+                    if (shouldIgnoreClick(event)) return;
                     setChecked(
                       selectedPaths.length === detected.length
                         ? {}
                         : Object.fromEntries(
                             detected.map((game) => [game.path, true]),
                           ),
-                    )
-                  }
+                    );
+                  }}
                   className="rounded normal-case tracking-normal text-white/70 underline-offset-4 outline-none transition hover:text-white hover:underline focus:text-white focus:ring-2 focus:ring-white/70 disabled:opacity-40"
                 >
                   {selectedPaths.length === detected.length
@@ -447,7 +464,10 @@ export function AddGameModal({
           <button
             type="button"
             data-gp-focusable=""
-            onClick={onClose}
+            onClick={(event) => {
+              if (shouldIgnoreClick(event)) return;
+              onClose();
+            }}
             disabled={busy}
             className="rounded-lg px-4 py-2 text-sm text-white/70 outline-none transition hover:text-white focus:text-white focus:ring-2 focus:ring-white/70 disabled:opacity-40"
           >
@@ -456,7 +476,10 @@ export function AddGameModal({
           <button
             type="button"
             data-gp-focusable=""
-            onClick={() => onImport(selectedPaths)}
+            onClick={(event) => {
+              if (shouldIgnoreClick(event)) return;
+              onImport(selectedPaths);
+            }}
             disabled={busy || selectedPaths.length === 0}
             className="rounded-lg bg-white px-5 py-2 text-sm font-semibold text-[#101828] outline-none transition hover:bg-white/85 focus:ring-2 focus:ring-white/80 focus:ring-offset-2 focus:ring-offset-[#101828] disabled:opacity-40"
           >

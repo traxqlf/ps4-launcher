@@ -265,8 +265,20 @@ export function Ps4FlowBackground({ paused = false }: { paused?: boolean }) {
       frame = requestAnimationFrame(tick);
     };
 
+    // Fenêtre au premier plan : l'animation s'arrête dès un Alt-Tab, comme en
+    // session de jeu, pour ne laisser aucun rAF actif en arrière-plan.
+    let windowActive = true;
+
     const start = () => {
-      if (frame || pausedRef.current || document.hidden || reducedMotion) return;
+      if (
+        frame ||
+        pausedRef.current ||
+        document.hidden ||
+        !windowActive ||
+        reducedMotion
+      ) {
+        return;
+      }
       last = performance.now();
       frame = requestAnimationFrame(tick);
     };
@@ -282,13 +294,25 @@ export function Ps4FlowBackground({ paused = false }: { paused?: boolean }) {
       if (document.hidden) stop();
       else start();
     };
+    const onWindowFocus = () => {
+      windowActive = true;
+      start();
+    };
+    const onWindowBlur = () => {
+      windowActive = false;
+      stop();
+    };
 
     window.addEventListener("resize", onResize);
+    window.addEventListener("focus", onWindowFocus);
+    window.addEventListener("blur", onWindowBlur);
     document.addEventListener("visibilitychange", onVisibilityChange);
 
     return () => {
       stop();
       window.removeEventListener("resize", onResize);
+      window.removeEventListener("focus", onWindowFocus);
+      window.removeEventListener("blur", onWindowBlur);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       startRef.current = () => {};
       stopRef.current = () => {};

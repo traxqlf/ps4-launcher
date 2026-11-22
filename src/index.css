@@ -54,6 +54,28 @@ textarea,
   font-family: "SST", sans-serif !important;
 }
 
+/* Mode manette : curseur masqué et interface insensible à la souris.
+   `html` et `body` gardent pointer-events: auto pour que window continue de
+   recevoir mousemove / mousedown (réveil du curseur) dans WKWebView comme
+   dans WebView2. En revanche tous les descendants de body passent en
+   pointer-events: none : WebKit / Chromium retirent alors immédiatement
+   l'état :hover de l'élément qui se trouvait sous le pointeur au moment où
+   la manette prend la main. */
+html.input-mode-gamepad,
+body.input-mode-gamepad,
+body.input-mode-gamepad * {
+  cursor: none !important;
+}
+
+html.input-mode-gamepad,
+body.input-mode-gamepad {
+  pointer-events: auto !important;
+}
+
+body.input-mode-gamepad * {
+  pointer-events: none !important;
+}
+
 :root {
   /* 1 px de design vaut 1 px réel en 1920 × 1080, et se réduit avec la fenêtre. */
   --ps4-unit: min(0.0520833vw, 0.0925926vh);

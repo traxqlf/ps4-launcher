@@ -9,6 +9,8 @@ const LOGIN_THEME_SRC = "/sounds/loginPs4.mp3";
 const LOGIN_JINGLE_SRC = "/sounds/snd_log_login-se_log_login.wav";
 const BGM_VOLUME = 0.35;
 const BGM_FADE_MS = 1500;
+// Retour au premier plan (ou fin de session) : reprise courte et douce.
+const GATE_FADE_MS = 250;
 // Fondu sortant du thème de chargement à l'arrivée sur l'accueil.
 const LOGIN_FADE_MS = 250;
 const BGM_MUTED_KEY = "ps4-launcher:bgm-muted";
@@ -128,6 +130,79 @@ function readBgmMuted(): boolean {
 
 let bgmMuted = readBgmMuted();
 
+/* ─────────────── Verrou audio global : focus + session de jeu ─────────────── */
+
+// `true` uniquement quand la fenêtre est au premier plan et qu'aucun jeu n'est
+// lancé. Le front le pilote via `useAudioGate` ; on démarre ouvert pour que le
+// thème de connexion ne soit jamais coupé par un faux négatif au montage.
+let audioAllowed = true;
+// Pistes HTMLAudioElement interrompues par le verrou, à reprendre au retour.
+let loginThemeGatePaused = false;
+let loginJingleGatePaused = false;
+
+/** Vrai tant que l'application peut émettre du son (premier plan, hors jeu). */
+export function isAudioAllowed(): boolean {
+  return audioAllowed;
+}
+
+/**
+ * Verrou audio central, appelé par `useAudioGate` à chaque changement de focus
+ * ou de session de jeu. Fermé : tout est coupé sur-le-champ (pistes
+ * HTMLAudioElement, contexte Web Audio, fondus en cours). Ouvert : l'audio
+ * reprend avec un fondu entrant court, jamais avant que l'utilisateur soit
+ * revenu sur le launcher.
+ */
+export function setAudioAllowed(allowed: boolean): void {
+  if (audioAllowed === allowed) return;
+  audioAllowed = allowed;
+
+  if (!allowed) {
+    window.clearInterval(fadeTimer);
+    // Aucune boucle de rattrapage ne doit survivre en arrière-plan (0 % CPU).
+    stopUnlockWatcher();
+    bgm?.pause();
+    loginThemeGatePaused = Boolean(loginTheme && !loginTheme.paused);
+    loginTheme?.pause();
+    loginJingleGatePaused = Boolean(loginJingle && !loginJingle.paused);
+    loginJingle?.pause();
+    // Thème de jeu, bruitages et sources en cours : tout se tait.
+    suspendAudioEngine();
+    return;
+  }
+
+  resumeAudioEngine();
+
+  if (loginThemeGatePaused) {
+    loginThemeGatePaused = false;
+    const theme = loginTheme;
+    if (theme) {
+      void theme
+        .play()
+        .catch((cause) =>
+          console.warn("[ps4Audio] reprise du thème de connexion:", cause),
+        );
+    }
+  }
+
+  if (loginJingleGatePaused) {
+    loginJingleGatePaused = false;
+    const jingle = loginJingle;
+    if (jingle) {
+      void jingle
+        .play()
+        .catch((cause) =>
+          console.warn("[ps4Audio] reprise du jingle de connexion:", cause),
+        );
+    }
+  }
+
+  // Musique du menu : seulement si elle était demandée (jamais sous un splash
+  // ni après un lancement) et que rien ne la remplace.
+  if (bgmRequested && !bgmMuted && !loginJingleActive && bgm?.paused) {
+    playBgmWithFade(GATE_FADE_MS);
+  }
+}
+
 function getContext(): AudioContext | null {
   if (typeof window === "undefined") return null;
   const Constructor =
@@ -156,7 +231,11 @@ function getContext(): AudioContext | null {
       window.addEventListener("pointerdown", unlock, { once: true });
       window.addEventListener("keydown", unlock, { once: true });
     }
-    if (context.state === "suspended") void context.resume().catch(() => {});
+    // Ne jamais réveiller le contexte tant que le verrou audio est fermé :
+    // un bruitage refusé ne doit pas relancer la musique en arrière-plan.
+    if (audioAllowed && context.state === "suspended") {
+      void context.resume().catch(() => {});
+    }
     return context;
   } catch {
     return null;
@@ -216,7 +295,8 @@ function allow(name: SoundName): boolean {
 }
 
 function play(name: SoundName, volume: number) {
-  if (bgmMuted) return;
+  // Jeu en cours ou fenêtre en arrière-plan : aucun bruitage UI ne sort.
+  if (bgmMuted || !audioAllowed) return;
   const audio = getContext();
   if (!audio) return;
 
@@ -237,6 +317,47 @@ function play(name: SoundName, volume: number) {
 }
 
 /* ─────────────── Mixage : API de réglages ─────────────── */
+
+// Aperçu « Effets système » : un cran = un bruitage du curseur. Le bus des
+// bruitages porte déjà le nouveau volume, donc l'oreille entend exactement le
+// réglage qui vient d'être choisi. Cadencé pour ne pas mitrailler au glisser.
+const PREVIEW_INTERVAL_MS = 70;
+let lastPreviewAt = 0;
+
+/** Rejoue le curseur au volume d'effets courant (aperçu en direct PS4). */
+export function previewEffectsVolume(): void {
+  if (bgmMuted || !audioAllowed) return;
+
+  const now = performance.now();
+  if (now - lastPreviewAt < PREVIEW_INTERVAL_MS) return;
+  lastPreviewAt = now;
+
+  const audio = getContext();
+  if (!audio) return;
+
+  const name: SoundName = buffers.cursor ? "cursor" : "confirm";
+  const buffer = buffers[name];
+  if (!buffer) {
+    // Contexte créé après le préchargement : on rattrape au cran suivant.
+    preloadSounds();
+    return;
+  }
+
+  const source = audio.createBufferSource();
+  source.buffer = buffer;
+  const amp = audio.createGain();
+  amp.gain.value = 0.42 * (gains[name] ?? 1);
+  source.connect(amp);
+  amp.connect(effectsBus ?? master ?? audio.destination);
+  source.onended = () => {
+    try {
+      amp.disconnect();
+    } catch {
+      // Déjà déconnecté : rien à faire.
+    }
+  };
+  source.start();
+}
 
 export function getAudioSettings(): AudioSettings {
   return { ...audioSettings };
@@ -268,8 +389,11 @@ export function updateAudioSettings(
     // localStorage indisponible : le réglage reste en mémoire pour la session.
   }
 
-  // Chaque interaction réveille le contexte (WKWebView le suspend au repos).
-  if (context?.state === "suspended") void context.resume().catch(() => {});
+  // Chaque interaction réveille le contexte (WKWebView le suspend au repos),
+  // sauf si le verrou audio est fermé (jeu lancé, fenêtre en arrière-plan).
+  if (audioAllowed && context?.state === "suspended") {
+    void context.resume().catch(() => {});
+  }
   applyAudioSettings();
   return getAudioSettings();
 }
@@ -649,7 +773,7 @@ let bgmWarned = false;
 export function startLoginTheme() {
   if (loginThemeStarted || typeof window === "undefined") return;
   loginThemeStarted = true;
-  if (bgmMuted) return;
+  if (bgmMuted || !audioAllowed) return;
 
   try {
     const audio = new Audio(LOGIN_THEME_SRC);
@@ -672,7 +796,7 @@ export function playLoginJingle() {
   if (loginJinglePlayed || typeof window === "undefined") return;
   loginJinglePlayed = true;
   fadeOutLoginTheme();
-  if (bgmMuted) return;
+  if (bgmMuted || !audioAllowed) return;
 
   try {
     const audio = new Audio(LOGIN_JINGLE_SRC);
@@ -759,7 +883,7 @@ function getBgm(): HTMLAudioElement | null {
   return bgm;
 }
 
-function fadeBgmTo(target: number) {
+function fadeBgmTo(target: number, durationMs = BGM_FADE_MS) {
   const audio = bgm;
   if (!audio) return;
   window.clearInterval(fadeTimer);
@@ -770,7 +894,7 @@ function fadeBgmTo(target: number) {
       window.clearInterval(fadeTimer);
       return;
     }
-    const ratio = Math.min(1, (performance.now() - startedAt) / BGM_FADE_MS);
+    const ratio = Math.min(1, (performance.now() - startedAt) / durationMs);
     audio.volume = Math.max(0, Math.min(1, from + (target - from) * ratio));
     if (ratio >= 1) window.clearInterval(fadeTimer);
   }, 40);
@@ -812,7 +936,10 @@ function watchUnlock() {
   }, GAMEPAD_POLL_MS);
 }
 
-function playBgmWithFade() {
+function playBgmWithFade(fadeMs = BGM_FADE_MS) {
+  // Verrou fermé : la demande reste en attente (`bgmRequested`), la reprise
+  // partira d'elle-même au retour au premier plan.
+  if (!audioAllowed) return;
   const audio = getBgm();
   if (!audio) return;
   audio.muted = false;
@@ -821,7 +948,7 @@ function playBgmWithFade() {
   void audio
     .play()
     .then(() => {
-      fadeBgmTo(BGM_VOLUME);
+      fadeBgmTo(BGM_VOLUME, fadeMs);
       stopUnlockWatcher();
     })
     .catch((cause) => {
@@ -862,6 +989,9 @@ export function pauseBgm() {
 export function resumeBgm() {
   bgmRequested = true;
   if (bgmMuted) return;
+  // Jeu en cours ou fenêtre en arrière-plan : la demande est mémorisée mais
+  // rien n'est joué avant le retour au premier plan.
+  if (!audioAllowed) return;
   // Le jingle de connexion garde la main jusqu'à sa fin.
   if (loginJingleActive) return;
   if (bgm && !bgm.paused) return;

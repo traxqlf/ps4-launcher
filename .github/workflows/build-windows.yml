@@ -24,18 +24,18 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build
-      - name: Compresser les exécutables dans ps4-launcher-windows.zip
+      - name: Compresser les exécutables dans PulsePS4-windows.zip
         shell: pwsh
         run: |
           $files = @()
           $files += Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -File
-          $files += Get-Item -Path "src-tauri/target/release/ps4-launcher.exe" -ErrorAction SilentlyContinue
+          $files += Get-Item -Path "src-tauri/target/release/pulseps4.exe" -ErrorAction SilentlyContinue
           if ($files.Count -eq 0) {
             Write-Error "Aucun exécutable trouvé pour l'archive."
             exit 1
           }
           $files | ForEach-Object { Write-Host "Ajout à l'archive : $($_.FullName)" }
-          Compress-Archive -Path $files.FullName -DestinationPath "ps4-launcher-windows.zip" -Force
+          Compress-Archive -Path $files.FullName -DestinationPath "PulsePS4-windows.zip" -Force
       - name: Générer latest.json pour l'updater Tauri
         id: manifest
         shell: pwsh
@@ -66,7 +66,7 @@ jobs:
 
           $latest = [ordered]@{
             version   = $version
-            notes     = "PS4 Launcher v$version"
+            notes     = "PulsePS4 v$version"
             pub_date  = $pubDate
             platforms = [ordered]@{
               "windows-x86_64" = [ordered]@{
@@ -88,12 +88,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.manifest.outputs.version }}
-          name: PS4 Launcher v${{ steps.manifest.outputs.version }}
+          name: PulsePS4 v${{ steps.manifest.outputs.version }}
           make_latest: true
           fail_on_unmatched_files: true
           files: |
             latest.json
-            ps4-launcher-windows.zip
+            PulsePS4-windows.zip
             src-tauri/target/release/bundle/nsis/*-setup.exe
             src-tauri/target/release/bundle/nsis/*-setup.exe.sig
-            src-tauri/target/release/ps4-launcher.exe
+            src-tauri/target/release/pulseps4.exe

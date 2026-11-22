@@ -3036,8 +3036,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ps4-launcher"
-version = "0.1.1"
+name = "pulseps4"
+version = "1.0.1"
 dependencies = [
  "base64 0.22.1",
  "png 0.17.16",

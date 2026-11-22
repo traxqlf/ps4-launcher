@@ -32,11 +32,14 @@ const BOOT_STYLES = `
 .ps4-boot-emblem {
   animation: ps4-boot-emblem 1.2s cubic-bezier(0.22, 0.8, 0.24, 1) 0.45s both;
   filter: drop-shadow(0 0 26px rgba(150, 205, 255, 0.55));
+  /* Le zoom part du centre de l'écran : jamais poussé vers un coin. */
+  transform-origin: center center;
 }
 .ps4-boot-subtitle { animation: ps4-boot-subtitle 0.9s ease-out 1.3s both; }
 .ps4-boot-halo {
   background: radial-gradient(circle, rgba(90, 170, 255, 0.35), transparent 65%);
   animation: ps4-boot-glow 1.6s ease-out 0.4s both;
+  transform-origin: center center;
 }
 @media (prefers-reduced-motion: reduce) {
   .ps4-boot-light,

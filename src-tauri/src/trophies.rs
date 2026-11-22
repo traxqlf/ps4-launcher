@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const API_URL: &str =
     "https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v2/";
@@ -112,7 +112,7 @@ struct TextCache {
     entries: HashMap<String, AchievementText>,
 }
 
-#[derive(Default, Debug, Serialize)]
+#[derive(Default, Debug, Clone, Serialize)]
 pub struct TrophyCounts {
     pub bronze: usize,
     pub silver: usize,
@@ -120,7 +120,7 @@ pub struct TrophyCounts {
     pub platinum: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TrophyReport {
     pub appid: String,
     pub progress: f64,
@@ -503,39 +503,77 @@ fn cache_path(app: &tauri::AppHandle, appid: &str) -> Result<PathBuf, String> {
     Ok(dir.join(format!("{appid}.json")))
 }
 
-#[cfg(target_os = "windows")]
-fn unlocked_paths(_app: &tauri::AppHandle, appid: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+/// Émulateurs qui écrivent leurs succès dans un dossier nommé d'après l'AppID.
+const EMULATORS: [&str; 5] = ["CODEX", "RUNE", "EMPRESS", "FLT", "TENOKE"];
+
+/// Racines où les émulateurs déposent les succès, selon la plateforme.
+fn save_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     if let Some(appdata) = std::env::var_os("APPDATA") {
-        let root = PathBuf::from(appdata);
-        paths.push(
-            root.join("Goldberg SteamEmu Saves")
-                .join(appid)
-                .join("achievements.json"),
-        );
-        paths.push(root.join("GSE Saves").join(appid).join("achievements.json"));
-        for emulator in ["CODEX", "RUNE", "TENOKE"] {
-            paths.push(root.join(emulator).join(appid).join("achievements.ini"));
-        }
+        roots.push(PathBuf::from(appdata));
     }
-    // Dépôt public partagé par les émulateurs de sauvegarde.
-    let public = PathBuf::from("C:\\Users\\Public\\Documents\\Steam");
-    for emulator in ["CODEX", "RUNE", "TENOKE"] {
-        paths.push(public.join(emulator).join(appid).join("achievements.ini"));
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local));
     }
-    paths
+    // Dépôt public partagé par les émulateurs sous Windows.
+    if let Some(public) = std::env::var_os("PUBLIC") {
+        let public = PathBuf::from(public);
+        roots.push(public.join("Documents").join("Steam"));
+        roots.push(public.join("Documents"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        roots.push(home.join("Library").join("Application Support"));
+        roots.push(home.join(".local").join("share"));
+        roots.push(home.join(".config"));
+        roots.push(home.join("Documents"));
+    }
+    roots
 }
 
-#[cfg(not(target_os = "windows"))]
-fn unlocked_paths(app: &tauri::AppHandle, appid: &str) -> Vec<PathBuf> {
-    let Ok(dir) = app.path().app_data_dir() else {
-        return Vec::new();
-    };
-    vec![
-        dir.join("trophies")
-            .join("unlocked")
-            .join(format!("{appid}.json")),
-    ]
+/// Tous les fichiers où un émulateur peut avoir consigné les succès du jeu.
+/// L'ordre n'a pas d'importance : les déblocages sont fusionnés sans perte.
+fn unlocked_paths(
+    app: &tauri::AppHandle,
+    appid: &str,
+    game_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for root in save_roots() {
+        for saves in ["Goldberg SteamEmu Saves", "GSE Saves"] {
+            paths.push(root.join(saves).join(appid).join("achievements.json"));
+        }
+        for emulator in EMULATORS {
+            paths.push(
+                root.join("Steam")
+                    .join(emulator)
+                    .join(appid)
+                    .join("achievements.ini"),
+            );
+            paths.push(root.join(emulator).join(appid).join("achievements.ini"));
+            paths.push(root.join(emulator).join(appid).join("achievements.json"));
+        }
+    }
+    if let Some(dir) = game_dir {
+        for relative in [
+            "steam_settings/achievements.json",
+            "steam_settings/achievements.ini",
+            "steam_settings/stats.json",
+            "achievements.json",
+            "achievements.ini",
+        ] {
+            paths.push(dir.join(relative));
+        }
+    }
+    // Dépôt local du launcher : banc d'essai et plateformes sans émulateur.
+    if let Ok(dir) = app.path().app_data_dir() {
+        paths.push(
+            dir.join("trophies")
+                .join("unlocked")
+                .join(format!("{appid}.json")),
+        );
+    }
+    paths
 }
 
 fn earned_time_of(value: &Value) -> u64 {
@@ -603,9 +641,9 @@ fn parse_ini_achievements(raw: &str, earned: &mut EarnedState) {
     }
 }
 
-fn load_earned(app: &tauri::AppHandle, appid: &str) -> EarnedState {
+fn load_earned(app: &tauri::AppHandle, appid: &str, game_dir: Option<&Path>) -> EarnedState {
     let mut earned = EarnedState::default();
-    for path in unlocked_paths(app, appid) {
+    for path in unlocked_paths(app, appid, game_dir) {
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
@@ -966,6 +1004,40 @@ pub async fn get_game_trophies(
     steam_appid: String,
     mark_new: Option<bool>,
 ) -> Result<TrophyReport, String> {
+    let game_dir = crate::game_dir_for_appid(&app, &steam_appid);
+    build_report(app, steam_appid, game_dir, mark_new.unwrap_or(true)).await
+}
+
+/// Payload diffusé au frontend dès qu'un rapport est recalculé, pour que
+/// l'Accueil, le Profil, la Bibliothèque et l'écran Trophées se rafraîchissent.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrophiesUpdated {
+    pub game_id: String,
+    pub appid: String,
+    pub report: TrophyReport,
+}
+
+pub fn emit_updated(app: &tauri::AppHandle, game_id: &str, report: &TrophyReport) {
+    let payload = TrophiesUpdated {
+        game_id: game_id.to_string(),
+        appid: report.appid.clone(),
+        report: report.clone(),
+    };
+    if let Err(error) = app.emit("trophies-updated", payload) {
+        eprintln!("[trophées] diffusion de l'événement impossible: {error}");
+    }
+}
+
+/// Recalcul complet d'un jeu : schéma, raretés puis déblocages fusionnés
+/// (émulateurs, dossier du jeu, compte Steam). Réutilisé par la commande
+/// manuelle et par les déclencheurs automatiques.
+pub async fn build_report(
+    app: tauri::AppHandle,
+    steam_appid: String,
+    game_dir: Option<PathBuf>,
+    mark_new: bool,
+) -> Result<TrophyReport, String> {
     if steam_appid.is_empty() || !steam_appid.chars().all(|c| c.is_ascii_digit()) {
         return Err(format!("Steam AppID invalide: {steam_appid}"));
     }
@@ -979,8 +1051,8 @@ pub async fn get_game_trophies(
 
     let (entries, offline) = load_percentages(&app, &steam_appid).await?;
 
-    // Déblocages locaux (émulateurs Windows) puis compte Steam officiel.
-    let mut earned = load_earned(&app, &steam_appid);
+    // Déblocages locaux (émulateurs, dossier du jeu) puis compte Steam officiel.
+    let mut earned = load_earned(&app, &steam_appid, game_dir.as_deref());
     if let (Some(key), false) = (api_key.as_deref(), steam_id.is_empty())
         && let Ok(client) = http_client()
     {
@@ -992,7 +1064,7 @@ pub async fn get_game_trophies(
     // les vrais libellés et les icônes officielles.
     let texts = load_achievement_texts(&app, &steam_appid, api_key.as_deref()).await;
 
-    let track = mark_new.unwrap_or(true);
+    let track = mark_new;
     let mut state = load_state(&app);
     let previous = state.games.get(&steam_appid).cloned();
     let first_check = previous.is_none();

@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::Manager;
 use uuid::Uuid;
 
@@ -10,8 +12,7 @@ use base64::Engine as _;
 
 mod trophies;
 
-#[cfg(target_os = "windows")]
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tauri::Emitter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,7 +189,15 @@ fn derive_title(exe: &Path, dir: &Path) -> String {
     }
 }
 
+/// Détection locale, par ordre de fiabilité : `steam_appid.txt`, clé `AppId`
+/// des `.ini`/`.cfg` d'émulateur, puis manifestes Steam.
 fn find_steam_appid(dir: &Path) -> Option<String> {
+    scan_for_steam_appid_file(dir)
+        .or_else(|| scan_for_appid_key(dir))
+        .or_else(|| steam_appid_from_manifests(dir))
+}
+
+fn scan_for_steam_appid_file(dir: &Path) -> Option<String> {
     let mut dirs = vec![(dir.to_path_buf(), 0usize)];
     while let Some((current, depth)) = dirs.pop() {
         let Ok(entries) = fs::read_dir(&current) else {
@@ -224,7 +233,87 @@ fn find_steam_appid(dir: &Path) -> Option<String> {
             }
         }
     }
-    steam_appid_from_manifests(dir)
+    None
+}
+
+/// Fichiers de configuration des émulateurs qui portent l'AppID d'origine
+/// (`steam_emu.ini`, `ALI213.ini`, `codex.ini`, `rune.ini`, `valve.ini`…).
+const APPID_CONFIG_FILES: [&str; 8] = [
+    "steam_emu.ini",
+    "steam_api.ini",
+    "ali213.ini",
+    "codex.ini",
+    "rune.ini",
+    "valve.ini",
+    "empress.ini",
+    "flt.ini",
+];
+
+fn scan_for_appid_key(dir: &Path) -> Option<String> {
+    let mut dirs = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((current, depth)) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        let mut names: Vec<(PathBuf, usize)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 2 {
+                    dirs.push((path, depth + 1));
+                }
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            let is_config = lower.ends_with(".ini") || lower.ends_with(".cfg");
+            if !is_config {
+                continue;
+            }
+            let priority = usize::from(!APPID_CONFIG_FILES.contains(&lower.as_str()));
+            names.push((path, priority));
+        }
+        // Les fichiers d'émulateur connus passent avant les `.ini` quelconques.
+        names.sort_by_key(|(_, priority)| *priority);
+        for (path, _) in names {
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Some(id) = appid_from_config(&content) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Lit une ligne `AppId=12345` (ou `appid = 12345`) dans un fichier ini.
+fn appid_from_config(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') || line.starts_with('[')
+        {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("appid") {
+            continue;
+        }
+        let id: String = value
+            .trim()
+            .trim_matches(['"', '\''])
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        if id.len() >= 2 && id.chars().any(|c| c != '0') {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// Retrouve l'AppID officiel via `steamapps/appmanifest_*.acf` quand le jeu est
@@ -476,11 +565,91 @@ fn strip_edition_suffix(words: &mut Vec<String>) {
     }
 }
 
+/// Remplace `needle` sans tenir compte de la casse (les deux chaînes ASCII
+/// partagent leurs index d'octets).
+fn replace_ignore_ascii_case(raw: &str, needle: &str, replacement: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let mut out = String::with_capacity(raw.len());
+    let mut cursor = 0usize;
+    while let Some(index) = lower[cursor..].find(needle) {
+        let start = cursor + index;
+        out.push_str(&raw[cursor..start]);
+        out.push_str(replacement);
+        cursor = start + needle.len();
+    }
+    out.push_str(&raw[cursor..]);
+    out
+}
+
+/// Retire les suffixes de build (`Win64-Shipping`, `Shipping`) avant découpe.
+fn strip_build_noise(raw: &str) -> String {
+    let mut out = raw.to_string();
+    for noise in [
+        "win64-shipping",
+        "win32-shipping",
+        "win64shipping",
+        "win32shipping",
+    ] {
+        out = replace_ignore_ascii_case(&out, noise, " ");
+    }
+    out
+}
+
+/// Retire les jetons techniques isolés (`x64`, `Shipping`, `Win64`…).
+fn strip_noise_words(raw: &str) -> String {
+    raw.split_whitespace()
+        .filter(|word| {
+            let bare = word
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase();
+            !BUILD_NOISE_TOKENS.contains(&bare.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Sépare le CamelCase et les nombres collés : `Cyberpunk2077` →
+/// `Cyberpunk 2077`, `witcher3` → `witcher 3`.
+fn split_camel_and_digits(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut previous: Option<char> = None;
+    // Lettres consécutives du jeton courant : une seule lettre ne se sépare pas
+    // de son chiffre (`F1 23`), deux ou plus oui (`witcher3`).
+    let mut alpha_run = 0usize;
+    for ch in raw.chars() {
+        if let Some(prev) = previous {
+            let camel = (prev.is_lowercase() && ch.is_uppercase())
+                || (prev.is_ascii_alphabetic() && ch.is_ascii_digit() && alpha_run >= 2);
+            if camel {
+                out.push(' ');
+                alpha_run = 0;
+            }
+        }
+        out.push(ch);
+        if ch.is_ascii_alphabetic() {
+            alpha_run += 1;
+        } else if !ch.is_ascii_digit() {
+            alpha_run = 0;
+        }
+        previous = Some(ch);
+    }
+    out
+}
+
+/// Jetons techniques qui ne désignent jamais un titre de jeu.
+const BUILD_NOISE_TOKENS: [&str; 8] = [
+    "shipping", "win64", "win32", "x64", "x86", "dx11", "dx12", "vulkan",
+];
+
 /// Nom exploitable pour la boutique Steam : sans extension, version, tag ni édition.
 fn clean_search_title(raw: &str) -> String {
     let trimmed = raw.trim();
-    let without_tags = remove_bracket_tags(strip_media_extension(trimmed));
-    let flattened = without_tags.replace(['_', '·'], " ");
+    let without_noise = strip_build_noise(trimmed);
+    let without_extension = strip_media_extension(&without_noise);
+    let without_words = strip_noise_words(&without_extension);
+    let without_tags = remove_bracket_tags(&without_words);
+    let spaced = split_camel_and_digits(&without_tags);
+    let flattened = spaced.replace(['_', '·'], " ");
     let words: Vec<String> = flattened.split_whitespace().map(str::to_string).collect();
 
     let mut kept: Vec<String> = Vec::with_capacity(words.len());
@@ -488,6 +657,11 @@ fn clean_search_title(raw: &str) -> String {
     while index < words.len() {
         let word = &words[index];
         let lower = word.to_ascii_lowercase();
+        let bare = lower.trim_matches(|c: char| !c.is_alphanumeric());
+        if BUILD_NOISE_TOKENS.contains(&bare) {
+            index += 1;
+            continue;
+        }
         if VERSION_KEYWORDS.contains(&lower.as_str())
             && words.get(index + 1).is_some_and(|next| {
                 !next.is_empty()
@@ -800,34 +974,6 @@ async fn steamgriddb_square_cover_url(
     sgdb_square_cover_by_id(client, api_key, &format!("game/{sgdb_id}")).await
 }
 
-#[cfg(target_os = "windows")]
-fn launch_executable(
-    exe: &Path,
-    title: &str,
-    args: &[String],
-) -> Result<std::process::Child, String> {
-    use std::os::windows::process::CommandExt;
-
-    // CREATE_NEW_PROCESS_GROUP : le jeu ne partage pas le groupe de processus
-    // du launcher et peut être détaché proprement, comme un jeu non-Steam.
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-
-    let parent = exe
-        .parent()
-        .ok_or_else(|| format!("dossier parent introuvable pour {}", exe.display()))?;
-    std::process::Command::new(exe)
-        .current_dir(parent)
-        .args(args)
-        // Aucun descripteur bloquant hérité : les sorties du jeu ne retiennent
-        // ni le launcher ni un pipe ouvert.
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_NEW_PROCESS_GROUP)
-        .spawn()
-        .map_err(|e| format!("lancement de {title} impossible: {e}"))
-}
-
 /* ────────────── Fenêtre du jeu : attente de la première image ────────────── */
 
 /// Payload de disponibilité du jeu : le splash peut rendre la main.
@@ -1136,14 +1282,53 @@ mod process_guard {
 #[cfg(target_os = "windows")]
 const PROCESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// Durée simulée d'une session hors Windows : permet de tester le cycle
-/// complet (minimisation, événement de fin, restauration) sans exécutable.
-#[cfg(not(target_os = "windows"))]
-const SIMULATED_SESSION_SECONDS: u64 = 5;
+/// Écart entre deux lectures de la table des processus : 5 s suffisent pour
+/// mesurer une session et gardent un coût CPU nul pendant la partie.
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Fenêtre simulée du jeu hors Windows : le splash se ferme au bout de 3 s.
-#[cfg(not(target_os = "windows"))]
-const SIMULATED_WINDOW_SECONDS: u64 = 3;
+/// Fenêtre de grâce après la sortie d'un bootstrapper (6 à 8 s) : le vrai jeu
+/// a le temps de créer ses processus avant le premier verdict.
+const BOOTSTRAP_GRACE: Duration = Duration::from_secs(7);
+
+/// Un exécutable qui rend la main en moins de 15 s est un lanceur intermédiaire
+/// (Rockstar, REDlauncher, `cmd /c start`, `.bat`…).
+const QUICK_EXIT: Duration = Duration::from_secs(15);
+
+/// Attente maximale d'un lanceur lent quand aucun processus du jeu n'a encore
+/// été observé : au-delà, la session est conclue.
+const STARTUP_BUDGET: Duration = Duration::from_secs(60);
+
+/// Profondeur d'exploration du dossier du jeu et plafond d'entrées lues : ce
+/// scan a lieu une seule fois au lancement, jamais pendant la partie.
+const SCAN_DEPTH: u8 = 3;
+const SCAN_LIMIT: usize = 4000;
+
+/// Dossiers techniques ignorés pendant la recherche des exécutables.
+const SKIPPED_DIRS: [&str; 9] = [
+    "_commonredist",
+    "redist",
+    "redistributables",
+    "directx",
+    "vcredist",
+    "support",
+    "installers",
+    ".git",
+    "node_modules",
+];
+
+/// Préfixes d'utilitaires jamais pris pour le jeu principal.
+const UTILITY_PREFIXES: [&str; 10] = [
+    "unins",
+    "crashreport",
+    "unitycrashhandler",
+    "vc_redist",
+    "vcredist",
+    "dxsetup",
+    "dxwebsetup",
+    "redprelauncher",
+    "setup",
+    "install",
+];
 
 /// Dossiers d'exécutables à dépasser pour retrouver la racine du jeu.
 #[cfg(any(target_os = "windows", test))]
@@ -1151,48 +1336,69 @@ const BINARY_DIRS: [&str; 8] = [
     "bin", "bin32", "bin64", "binaries", "win32", "win64", "x64", "x86",
 ];
 
-/// Racine du jeu : `...\Jeu\Binaries\Win64\Jeu.exe` → `...\Jeu`.
-#[cfg(any(target_os = "windows", test))]
+/// Racine du jeu : `...\Jeu\Binaries\Win64\Jeu.exe` → `...\Jeu`, et pour un
+/// bundle macOS `.../Jeu.app/Contents/MacOS/Jeu` → `.../Jeu.app`.
 fn game_root_dir(executable: &Path) -> PathBuf {
-    let mut current = executable
+    #[cfg(target_os = "macos")]
+    for ancestor in executable.ancestors() {
+        let is_bundle = ancestor
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"));
+        if is_bundle {
+            return ancestor.to_path_buf();
+        }
+    }
+
+    let parent = executable
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    for _ in 0..BINARY_DIRS.len() {
-        let name = current
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default();
-        if !BINARY_DIRS.contains(&name.as_str()) {
-            break;
+    #[cfg(any(target_os = "windows", test))]
+    {
+        let mut current = parent;
+        for _ in 0..BINARY_DIRS.len() {
+            let name = current
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            if !BINARY_DIRS.contains(&name.as_str()) {
+                break;
+            }
+            match current.parent() {
+                Some(parent) => current = parent.to_path_buf(),
+                None => break,
+            }
         }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => break,
-        }
+        return current;
     }
-    current
+
+    #[cfg(not(any(target_os = "windows", test)))]
+    parent
 }
 
 /// Un exécutable appartient-il au jeu ? Comparaison insensible à la casse et
 /// aux séparateurs, sans confondre `\Doom` avec `\Doom Eternal`.
-#[cfg(any(target_os = "windows", test))]
 fn path_is_inside(candidate: &Path, root: &Path) -> bool {
+    let separator = std::path::MAIN_SEPARATOR.to_string();
     let normalize = |path: &Path| {
-        let raw = path
-            .to_string_lossy()
-            .replace('/', "\\")
-            .to_ascii_lowercase();
+        let raw = path.to_string_lossy().to_string();
+        // Préfixe canonique `\\?\` retiré avant l'unification des séparateurs.
         let raw = raw
             .strip_prefix("\\\\?\\")
             .map(str::to_string)
             .unwrap_or(raw);
-        let trimmed = raw.trim_end_matches('\\');
+        let mut raw = raw.replace(['/', '\\'], &separator);
+        // Windows et macOS (APFS par défaut) sont insensibles à la casse.
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            raw = raw.to_lowercase();
+        }
+        let trimmed = raw.trim_end_matches(std::path::MAIN_SEPARATOR).to_string();
         if trimmed.ends_with(':') {
-            format!("{trimmed}\\")
+            format!("{trimmed}{separator}")
         } else {
-            trimmed.to_string()
+            trimmed
         }
     };
     let root = normalize(root);
@@ -1200,7 +1406,102 @@ fn path_is_inside(candidate: &Path, root: &Path) -> bool {
     if root.is_empty() || !candidate.starts_with(&root) {
         return false;
     }
-    matches!(candidate[root.len()..].chars().next(), None | Some('\\'))
+    matches!(
+        candidate[root.len()..].chars().next(),
+        None | Some(std::path::MAIN_SEPARATOR)
+    )
+}
+
+/// Ajoute un nom d'exécutable et son radical : `sysinfo` renvoie tantôt
+/// `Game.exe`, tantôt `Game` selon la plateforme qui publie le nom.
+fn insert_process_name(names: &mut HashSet<String>, name: &str) {
+    let lower = name.to_ascii_lowercase();
+    if let Some((stem, _)) = lower.rsplit_once('.') {
+        names.insert(stem.to_string());
+    }
+    names.insert(lower);
+}
+
+/// Utilitaire d'installation, de crash ou de redistribuable : jamais le jeu.
+fn is_utility_executable(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    UTILITY_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Vrai si le fichier peut être l'exécutable principal du jeu.
+fn is_game_executable(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    #[cfg(target_os = "windows")]
+    return extension == "exe";
+
+    #[cfg(target_os = "macos")]
+    return extension.is_empty() || extension == "exe";
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if extension == "exe" {
+            return true;
+        }
+        extension.is_empty()
+            && path
+                .metadata()
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+}
+
+/// Exécutables candidats sous la racine du jeu (profondeur ≤ 3), hors
+/// utilitaires. Aucun accès disque n'est fait ensuite pendant la session.
+fn scan_game_executables(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut budget = SCAN_LIMIT;
+    let mut stack = vec![(root.to_path_buf(), 0u8)];
+    while let Some((directory, depth)) = stack.pop() {
+        // Trois niveaux de sous-dossiers au maximum.
+        if depth >= SCAN_DEPTH {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if depth + 1 < SCAN_DEPTH && !SKIPPED_DIRS.contains(&name.as_str()) {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if is_utility_executable(name) || !is_game_executable(&path) {
+                continue;
+            }
+            found.push(path);
+            // Une bibliothèque de jeux peut être volumineuse : on s'arrête tôt.
+            if found.len() >= 64 {
+                return found;
+            }
+        }
+    }
+    found
 }
 
 /// Fenêtre de démarrage raté : session plus courte que cette durée avec un
@@ -1211,45 +1512,328 @@ const CRASH_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 /// concurrents (clavier, clic, manette) sont rejetés avant tout `Command::new`.
 static GAME_LAUNCH_LOCK: AtomicBool = AtomicBool::new(false);
 
-/// Attend la fin de tous les processus du jeu (le lanceur peut céder la main)
-/// et renvoie la durée exacte de la session ainsi que le code de sortie du
-/// processus lancé.
+/// Cible réelle d'un lancement : programme exécuté, dossier d'installation du
+/// jeu, et exécutables reconnus pendant toute la session.
+struct LaunchPlan {
+    program: PathBuf,
+    args: Vec<String>,
+    workdir: PathBuf,
+    root: PathBuf,
+    names: HashSet<String>,
+    /// Lancement indirect : raccourci, `.url`, `.bat` ou bundle `.app`. Le
+    /// processus initial n'est alors pas le jeu.
+    indirect: bool,
+}
+
 #[cfg(target_os = "windows")]
-fn monitor_game_processes(
-    root: &Path,
-    started: std::time::Instant,
-    exit_code: Option<i32>,
-    fast_failure: bool,
-) -> (std::time::Duration, Option<i32>) {
-    if root.parent().is_none() {
-        // Racine d'un disque : trop large pour servir de filtre.
-        return (started.elapsed(), exit_code);
+fn resolve_windows_shortcut(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+
+    // CREATE_NO_WINDOW : la résolution ne fait clignoter aucune console.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let escaped = path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "(New-Object -ComObject WScript.Shell).CreateShortcut('{escaped}').TargetPath"
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    let mut system = System::new();
-    // Un lanceur qui rend la main immédiatement laisse au vrai jeu le temps
-    // d'apparaître. Un échec rapide (code non nul) est conclu sans attendre,
-    // pour mesurer la session réelle et détecter le crash au démarrage.
-    if !fast_failure {
-        std::thread::sleep(PROCESS_POLL_INTERVAL);
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
     }
-    loop {
-        // Seul le chemin de l'exécutable est relu : ni environnement, ni disque,
-        // ni CPU/mémoire pour l'ensemble des processus.
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::new().with_exe(UpdateKind::OnlyIfNotSet),
-        );
-        let running = system
-            .processes()
-            .values()
-            .filter_map(|process| process.exe())
-            .any(|exe| path_is_inside(exe, root));
-        if !running {
-            return (started.elapsed(), exit_code);
+    let target = PathBuf::from(raw);
+    target.is_file().then_some(target)
+}
+
+/// Hors Windows, aucun raccourci `.lnk` n'existe : rien à résoudre.
+#[cfg(not(target_os = "windows"))]
+fn resolve_windows_shortcut(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Chemin réel visé par un raccourci `.lnk` (Windows) ou `.url`.
+fn resolve_shortcut(path: &Path) -> Option<PathBuf> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "lnk" => resolve_windows_shortcut(path),
+        "url" => {
+            let content = fs::read_to_string(path).ok()?;
+            let target = content.lines().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                if key.trim().eq_ignore_ascii_case("url") {
+                    Some(value.trim().to_string())
+                } else {
+                    None
+                }
+            })?;
+            let candidate = PathBuf::from(target);
+            candidate.is_file().then_some(candidate)
         }
-        std::thread::sleep(PROCESS_POLL_INTERVAL);
+        _ => None,
     }
+}
+
+impl LaunchPlan {
+    /// Prépare le lancement : résout le raccourci pour retrouver le dossier
+    /// d'installation, choisit le programme à exécuter et liste les
+    /// exécutables candidats du jeu.
+    fn build(exe: &Path, options: &[String]) -> Self {
+        let extension = exe
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let resolved = resolve_shortcut(exe);
+        let target = resolved.clone().unwrap_or_else(|| exe.to_path_buf());
+        let root = game_root_dir(&target);
+        let workdir = exe
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+
+        let mut program = exe.to_path_buf();
+        let mut args = options.to_vec();
+        let mut indirect = false;
+
+        #[cfg(target_os = "windows")]
+        {
+            match extension.as_str() {
+                // Un `.lnk` ou un `.url` passe par le shell : `Command` ne sait
+                // pas les exécuter directement. Le processus initial rend la
+                // main aussitôt, d'où le suivi par dossier / nom.
+                "lnk" | "url" => {
+                    program = PathBuf::from("cmd");
+                    args = vec![
+                        "/C".to_string(),
+                        "start".to_string(),
+                        String::new(),
+                        exe.to_string_lossy().to_string(),
+                    ];
+                    indirect = true;
+                }
+                "bat" | "cmd" => {
+                    program = PathBuf::from("cmd");
+                    args = vec![
+                        "/C".to_string(),
+                        "call".to_string(),
+                        exe.to_string_lossy().to_string(),
+                    ];
+                    indirect = true;
+                }
+                _ => {}
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        if extension == "app" || extension == "webloc" || extension == "url" {
+            // Un bundle `.app` est un dossier : il s'ouvre par LaunchServices.
+            program = PathBuf::from("open");
+            args = vec![exe.to_string_lossy().to_string()];
+            indirect = true;
+        }
+
+        // Le parent d'un raccourci non résolu peut être le Bureau : dans ce cas
+        // on se fie seulement au nom d'exécutable.
+        let scan = resolved.is_some() || extension != "lnk";
+        let mut names = HashSet::new();
+        if scan {
+            for candidate in scan_game_executables(&root) {
+                if let Some(name) = candidate.file_name().and_then(|name| name.to_str()) {
+                    insert_process_name(&mut names, name);
+                }
+            }
+        }
+        for candidate in [&target, exe] {
+            if let Some(name) = candidate.file_name().and_then(|name| name.to_str()) {
+                insert_process_name(&mut names, name);
+            }
+        }
+
+        Self {
+            program,
+            args,
+            workdir,
+            root,
+            names,
+            indirect,
+        }
+    }
+}
+
+/// Démarre le jeu depuis son dossier (DLL et sauvegardes locales incluses).
+fn spawn_game(plan: &LaunchPlan, title: &str) -> Result<std::process::Child, String> {
+    let mut command = std::process::Command::new(&plan.program);
+    command
+        .current_dir(&plan.workdir)
+        .args(&plan.args)
+        // Aucun descripteur bloquant hérité : les sorties du jeu ne retiennent
+        // ni le launcher ni un pipe ouvert.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    // CREATE_NEW_PROCESS_GROUP : le jeu ne partage pas le groupe de processus
+    // du launcher et peut être détaché proprement, comme un jeu non-Steam.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
+    command
+        .spawn()
+        .map_err(|error| format!("lancement de {title} impossible: {error}"))
+}
+
+/// Vrai si un processus du jeu est encore actif : processus lancé, descendant,
+/// exécutable installé dans le dossier du jeu, ou nom d'exécutable connu.
+fn find_game_process(system: &mut System, plan: &LaunchPlan, initial_pid: u32) -> bool {
+    // Seul le chemin des exécutables est relu : ni environnement, ni CPU ni
+    // mémoire pour l'ensemble de la table des processus.
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::new().with_exe(UpdateKind::OnlyIfNotSet),
+    );
+
+    let initial = Pid::from_u32(initial_pid);
+    let launcher = std::process::id();
+    // PID 0 : session adoptée (jeu déjà lancé), aucun parent à remonter.
+    let track_pid = initial_pid != 0;
+
+    // Descendants du processus lancé, directs ou indirects (un bootstrapper
+    // peut lui-même relancer un second processus).
+    let mut descendants: HashSet<Pid> = HashSet::new();
+    let mut grew = track_pid;
+    while grew {
+        grew = false;
+        for (pid, process) in system.processes() {
+            if *pid == initial || descendants.contains(pid) {
+                continue;
+            }
+            let from_session = process
+                .parent()
+                .is_some_and(|parent| parent == initial || descendants.contains(&parent));
+            if from_session {
+                descendants.insert(*pid);
+                grew = true;
+            }
+        }
+    }
+
+    // Racine d'un disque : trop large pour servir de filtre de chemin.
+    let match_path = plan.root.parent().is_some();
+    for (pid, process) in system.processes() {
+        if pid.as_u32() == launcher {
+            continue;
+        }
+        if track_pid && (*pid == initial || descendants.contains(pid)) {
+            return true;
+        }
+        // Nom publié par la table des processus : disponible même quand le
+        // chemin exact est refusé (processus élevé, protégé ou d'un autre
+        // utilisateur).
+        if plan
+            .names
+            .contains(&process.name().to_string_lossy().to_ascii_lowercase())
+        {
+            return true;
+        }
+        let Some(exe) = process.exe() else {
+            continue;
+        };
+        if match_path && path_is_inside(exe, &plan.root) {
+            return true;
+        }
+        if exe
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| plan.names.contains(&name.to_ascii_lowercase()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Surveille la session toutes les 5 s et renvoie la durée réelle une fois le
+/// dernier processus du jeu terminé. Aucune boucle ne tourne dans la WebView.
+fn monitor_game_session(
+    plan: &LaunchPlan,
+    initial_pid: u32,
+    child_exited: &AtomicBool,
+    fast_failure: &AtomicBool,
+    exit_code: &Mutex<Option<i32>>,
+    exit_at: &Mutex<Option<Instant>>,
+    started: Instant,
+) -> (Duration, Option<i32>) {
+    let mut system = System::new();
+    let mut last_seen = started;
+    let mut observed = false;
+    let mut bootstrap_exited = false;
+    // Lancement direct : le programme exécuté est lui-même dans le dossier du
+    // jeu, donc aucun lanceur ne peut apparaître après sa sortie.
+    let direct = !plan.indirect && path_is_inside(&plan.program, &plan.root);
+    // Lancement indirect : laisser le shell ou le lanceur démarrer le jeu.
+    let mut grace_deadline = plan.indirect.then(|| Instant::now() + BOOTSTRAP_GRACE);
+
+    loop {
+        std::thread::sleep(PROCESS_POLL_INTERVAL);
+        let now = Instant::now();
+        let child_alive = !child_exited.load(Ordering::Relaxed);
+        let matching = child_alive || find_game_process(&mut system, plan, initial_pid);
+        if matching {
+            observed = true;
+            last_seen = now;
+        }
+
+        if !child_alive && !bootstrap_exited {
+            bootstrap_exited = true;
+            // Échec immédiat (code non nul) : aucun lanceur à attendre.
+            if fast_failure.load(Ordering::Relaxed) && !matching {
+                break;
+            }
+            // Sortie rapide : c'était un bootstrapper, le vrai jeu arrive.
+            if now.duration_since(started) < QUICK_EXIT && grace_deadline.is_none() {
+                grace_deadline = Some(now + BOOTSTRAP_GRACE);
+            }
+        }
+
+        if matching || grace_deadline.is_some_and(|deadline| now < deadline) {
+            continue;
+        }
+        // Rien n'a encore été vu : un lanceur lent peut encore démarrer le jeu.
+        // Un jeu lancé directement n'a personne à attendre.
+        if !observed && !direct && now.duration_since(started) < STARTUP_BUDGET {
+            continue;
+        }
+        break;
+    }
+
+    // Session reconnue : dernière observation. Sinon, seule la durée du
+    // processus réellement lancé est créditée (échec de démarrage).
+    let elapsed = if observed {
+        last_seen.saturating_duration_since(started)
+    } else {
+        exit_at
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .map(|at| at.saturating_duration_since(started))
+            .unwrap_or_default()
+    };
+    let code = exit_code.lock().ok().and_then(|slot| *slot);
+    (elapsed, code)
 }
 
 /// Payload de fin de session : le front crédite la durée au jeu concerné.
@@ -1258,25 +1842,172 @@ fn monitor_game_processes(
 struct GameSessionEnded {
     game_id: String,
     duration_seconds: u64,
+    /// Total cumulé déjà écrit sur le disque : le front n'a rien à additionner.
+    total_playtime_seconds: u64,
+    /// Date de la dernière session (ms epoch), pour le tri « Récents ».
+    last_played: Option<u64>,
     exit_code: Option<i32>,
     crashed: bool,
 }
 
-/// Rend la main au launcher : fenêtre restaurée au premier plan, plein écran
-/// réimposé, puis événement de fin de session pour le front.
+/// Dossier d'installation du jeu : racine utile (dossier du bundle `.app`,
+/// dossier parent de l'exécutable) où chercher AppID et succès locaux.
+fn game_install_dir(game: &Game) -> Option<PathBuf> {
+    if game.exe_path.trim().is_empty() {
+        return None;
+    }
+    Some(game_root_dir(&PathBuf::from(game.exe_path.trim())))
+}
+
+/// Dossier d'un jeu déjà associé à un AppID (pour lire ses succès locaux).
+pub(crate) fn game_dir_for_appid(app: &tauri::AppHandle, appid: &str) -> Option<PathBuf> {
+    load_games(app)
+        .ok()?
+        .iter()
+        .find(|game| game.steam_appid.as_deref() == Some(appid))
+        .and_then(game_install_dir)
+}
+
+/// AppID d'un jeu : métadonnées, puis détection locale dans son dossier, puis
+/// recherche Steam par titre normalisé. Le résultat est mémorisé sur disque.
+async fn resolve_game_appid(app: &tauri::AppHandle, game: &Game) -> Option<String> {
+    if let Some(appid) = game.steam_appid.as_ref().filter(|id| !id.is_empty()) {
+        return Some(appid.clone());
+    }
+
+    let mut found = game_install_dir(game).and_then(|dir| find_steam_appid(&dir));
+    if found.is_none() {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("ps4-launcher/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .ok()?;
+        found = search_steam_appid(&client, &game.title).await.ok().flatten();
+    }
+    let appid = found?;
+
+    if let Ok(mut games) = load_games(app) {
+        if let Some(entry) = games.iter_mut().find(|entry| entry.id == game.id) {
+            entry.steam_appid = Some(appid.clone());
+        }
+        if let Err(error) = save_games(app, &games) {
+            eprintln!("[trophées] mémorisation de l'AppID impossible: {error}");
+        }
+    }
+    Some(appid)
+}
+
+/// Résolution + synchronisation multi-sources d'un jeu, puis diffusion du
+/// rapport complet au frontend (`trophies-updated`).
+async fn sync_trophies_for_game(
+    app: &tauri::AppHandle,
+    game_id: &str,
+) -> Result<trophies::TrophyReport, String> {
+    let games = load_games(app)?;
+    let game = games
+        .iter()
+        .find(|game| game.id == game_id)
+        .ok_or_else(|| format!("jeu introuvable: {game_id}"))?;
+    let appid = resolve_game_appid(app, game)
+        .await
+        .ok_or_else(|| format!("Steam AppID introuvable pour « {} »", game.title))?;
+    let game_dir = game_install_dir(game);
+    let report = trophies::build_report(app.clone(), appid, game_dir, true).await?;
+    trophies::emit_updated(app, game_id, &report);
+    Ok(report)
+}
+
+/// Action « Synchroniser les trophées » de l'écran Trophées.
+#[tauri::command]
+async fn sync_game_trophies(
+    app: tauri::AppHandle,
+    game_id: String,
+) -> Result<trophies::TrophyReport, String> {
+    sync_trophies_for_game(&app, &game_id).await
+}
+
+/// Synchronisation silencieuse : l'interface n'attend jamais le réseau.
+/// Ignorée pendant une partie pour respecter le 0 % CPU/GPU en jeu.
+fn trigger_trophy_sync(app: &tauri::AppHandle, game_id: String) {
+    if GAME_LAUNCH_LOCK.load(Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = sync_trophies_for_game(&app, &game_id).await {
+            eprintln!("[trophées] synchronisation de {game_id}: {error}");
+        }
+    });
+}
+
+/// Une seule passe au démarrage, en arrière-plan et sans jamais chevaucher une
+/// partie lancée entre-temps.
+fn sync_trophies_on_startup(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        // Laisse la WebView finir son premier rendu avant le réseau.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let games = load_games(&app).unwrap_or_default();
+        for game in games {
+            if GAME_LAUNCH_LOCK.load(Ordering::SeqCst) {
+                break;
+            }
+            let app_ref = app.clone();
+            let game_id = game.id.clone();
+            tauri::async_runtime::block_on(async move {
+                if let Err(error) = sync_trophies_for_game(&app_ref, &game_id).await {
+                    eprintln!("[trophées] démarrage, {game_id}: {error}");
+                }
+            });
+        }
+    });
+}
+
+/// Rend la main au launcher : durée créditée et sauvegardée, fenêtre restaurée
+/// au premier plan, plein écran réimposé, puis événements pour le front.
 fn finish_game_session(
     app: &tauri::AppHandle,
     game_id: &str,
-    elapsed: std::time::Duration,
+    elapsed: Duration,
     exit_code: Option<i32>,
 ) {
-    // La session est réellement terminée : un nouveau lancement est autorisé.
-    GAME_LAUNCH_LOCK.store(false, Ordering::SeqCst);
+    // Crédit immédiat côté Rust : la durée est écrite sur le disque même si la
+    // WebView est suspendue, masquée ou en cours de rechargement. L'unité est
+    // la seconde, donc les sessions de moins d'une minute restent comptées.
+    let seconds = elapsed.as_secs();
+    let mut total_playtime_seconds = 0u64;
+    let mut last_played = None;
+    match load_games(app) {
+        Ok(mut games) => {
+            if let Some(game) = games.iter_mut().find(|game| game.id == game_id) {
+                game.playtime_seconds = game.playtime_seconds.saturating_add(seconds);
+                game.last_played = Some(now_millis());
+                total_playtime_seconds = game.playtime_seconds;
+                last_played = game.last_played;
+            }
+            match save_games(app, &games) {
+                Ok(()) => {
+                    // Le front applique la liste telle quelle : accueil,
+                    // bibliothèque et profil affichent le nouveau total.
+                    if let Err(error) = app.emit("games-updated", &games) {
+                        eprintln!("[session] émission de games-updated impossible: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[session] sauvegarde du temps de jeu impossible: {error}")
+                }
+            }
+        }
+        Err(error) => eprintln!("[session] lecture de la bibliothèque impossible: {error}"),
+    }
+
     if let Some(window) = app.get_webview_window("main") {
+        // Ordre Windows : réafficher, restaurer, puis voler le premier plan.
+        // `unminimize` seul ne suffit pas si la fenêtre a été masquée.
+        let _ = window.show();
         let _ = window.set_always_on_top(false);
         let _ = window.unminimize();
-        let _ = window.set_focus();
         let _ = window.set_fullscreen(true);
+        let _ = window.set_focus();
     }
 
     // Un jeu qui rend la main presque aussitôt avec un code non nul n'a pas
@@ -1291,7 +2022,9 @@ fn finish_game_session(
     }
     let payload = GameSessionEnded {
         game_id: game_id.to_string(),
-        duration_seconds: elapsed.as_secs(),
+        duration_seconds: seconds,
+        total_playtime_seconds,
+        last_played,
         exit_code,
         crashed,
     };
@@ -1299,94 +2032,114 @@ fn finish_game_session(
         eprintln!("[session] émission de game-session-ended impossible: {error}");
     }
     let _ = app.emit("game-closed", game_id);
+
+    // La session est entièrement terminée et enregistrée : un nouveau lancement
+    // est autorisé. Le verrou n'est libéré qu'après l'écriture disque, pour
+    // qu'un lancement concurrent ne puisse pas écraser le total crédité.
+    GAME_LAUNCH_LOCK.store(false, Ordering::SeqCst);
+
+    // Succès obtenus pendant la partie : relus immédiatement après la fermeture.
+    trigger_trophy_sync(app, game_id.to_string());
 }
 
-#[cfg(not(target_os = "windows"))]
-fn launch_executable(exe: &Path, title: &str, args: &[String]) -> Result<(), String> {
-    println!(
-        "[simulation] lancement de \"{title}\" depuis {} (arguments: {:?})",
-        exe.display(),
-        args
-    );
-    Ok(())
-}
-
-/// Lance le jeu puis attend sa fermeture complète avant de rendre la main au
-/// launcher. Le processus est démarré ici (les erreurs remontent à l'appel),
-/// l'attente se fait dans un thread pour ne jamais bloquer l'interface.
-#[cfg(target_os = "windows")]
+/// Lance le jeu puis surveille sa session jusqu'à la fermeture complète. Le
+/// processus est démarré ici (les erreurs remontent à l'appel), la suite se
+/// fait dans des threads pour ne jamais bloquer l'interface.
 fn run_game_session(
     app: tauri::AppHandle,
     exe: PathBuf,
     title: String,
     args: Vec<String>,
     game_id: String,
-    started: std::time::Instant,
+    started: Instant,
 ) -> Result<(), String> {
-    let game_root = game_root_dir(&exe);
+    let plan = LaunchPlan::build(&exe, &args);
+
     // Snapshot avant le lancement : seules les fenêtres apparues ensuite
     // peuvent être celle du jeu.
+    #[cfg(target_os = "windows")]
     let snapshot = game_window::snapshot();
-    let mut child = launch_executable(&exe, &title, &args)?;
 
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watcher_app = app.clone();
-    let watcher_root = game_root.clone();
-    let watcher_game = game_id.clone();
-    let watcher_stop = stop.clone();
+    let mut child = spawn_game(&plan, &title)?;
+    let initial_pid = child.id();
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    #[cfg(target_os = "windows")]
+    {
+        let watcher_app = app.clone();
+        let watcher_root = plan.root.clone();
+        let watcher_game = game_id.clone();
+        let watcher_stop = stop.clone();
+        std::thread::spawn(move || {
+            game_window::watch(
+                watcher_app,
+                watcher_root,
+                watcher_game,
+                snapshot,
+                watcher_stop,
+            );
+        });
+    }
+
+    // Hors Windows, la fenêtre du jeu n'est pas détectable sans API système
+    // supplémentaire : le splash est libéré dès le démarrage du processus.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let ready_app = app.clone();
+        let ready_game = game_id.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let payload = GameWindowReady {
+                game_id: ready_game,
+            };
+            if let Err(error) = ready_app.emit("game-window-ready", payload) {
+                eprintln!("[jeu] émission de game-window-ready impossible: {error}");
+            }
+        });
+    }
+
+    // Sortie du processus initial, observée sans bloquer la surveillance : un
+    // lanceur intermédiaire rend la main bien avant la fin du jeu.
+    let child_exited = Arc::new(AtomicBool::new(false));
+    let fast_failure = Arc::new(AtomicBool::new(false));
+    let exit_code = Arc::new(Mutex::new(None));
+    let exit_at = Arc::new(Mutex::new(None));
+    {
+        let child_exited = child_exited.clone();
+        let fast_failure = fast_failure.clone();
+        let exit_code = exit_code.clone();
+        let exit_at = exit_at.clone();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let code = status.ok().and_then(|status| status.code());
+            let failed = Instant::now().saturating_duration_since(started) < CRASH_WINDOW
+                && code.is_some_and(|code| code != 0);
+            if let Ok(mut slot) = exit_code.lock() {
+                *slot = code;
+            }
+            if let Ok(mut slot) = exit_at.lock() {
+                *slot = Some(Instant::now());
+            }
+            fast_failure.store(failed, Ordering::Relaxed);
+            child_exited.store(true, Ordering::Relaxed);
+        });
+    }
+
     std::thread::spawn(move || {
-        game_window::watch(
-            watcher_app,
-            watcher_root,
-            watcher_game,
-            snapshot,
-            watcher_stop,
+        let (elapsed, code) = monitor_game_session(
+            &plan,
+            initial_pid,
+            &child_exited,
+            &fast_failure,
+            &exit_code,
+            &exit_at,
+            started,
         );
-    });
-
-    std::thread::spawn(move || {
-        // Le lanceur rend souvent la main avant le vrai jeu : on attend sa
-        // sortie, puis on surveille les processus de la racine du jeu.
-        let exit_code = child.wait().ok().and_then(|status| status.code());
-        let exited_after = started.elapsed();
-        let fast_failure = exited_after < CRASH_WINDOW && exit_code.is_some_and(|code| code != 0);
-        let (elapsed, exit_code) =
-            monitor_game_processes(&game_root, started, exit_code, fast_failure);
         // La session est finie : la surveillance de fenêtre ne doit plus
         // masquer le retour au launcher.
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        finish_game_session(&app, &game_id, elapsed, exit_code);
-    });
-    Ok(())
-}
-
-/// Simulation macOS / Linux : aucune attente de processus, une session de
-/// durée fixe tient lieu de jeu pour vérifier tout le cycle.
-#[cfg(not(target_os = "windows"))]
-fn run_game_session(
-    app: tauri::AppHandle,
-    exe: PathBuf,
-    title: String,
-    args: Vec<String>,
-    game_id: String,
-    started: std::time::Instant,
-) -> Result<(), String> {
-    launch_executable(&exe, &title, &args)?;
-    std::thread::spawn(move || {
-        // Fenêtre simulée : le splash se ferme après 3 s, comme un vrai jeu.
-        std::thread::sleep(std::time::Duration::from_secs(SIMULATED_WINDOW_SECONDS));
-        if let Err(error) = app.emit(
-            "game-window-ready",
-            GameWindowReady {
-                game_id: game_id.clone(),
-            },
-        ) {
-            eprintln!("[jeu] émission de game-window-ready impossible: {error}");
-        }
-        std::thread::sleep(std::time::Duration::from_secs(
-            SIMULATED_SESSION_SECONDS.saturating_sub(SIMULATED_WINDOW_SECONDS),
-        ));
-        finish_game_session(&app, &game_id, started.elapsed(), None);
+        stop.store(true, Ordering::Relaxed);
+        finish_game_session(&app, &game_id, elapsed, code);
     });
     Ok(())
 }
@@ -3348,8 +4101,9 @@ fn add_game(app: tauri::AppHandle, exe_path: String) -> Result<Vec<Game>, String
     }
 
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let new_id = Uuid::new_v4().to_string();
     games.push(Game {
-        id: Uuid::new_v4().to_string(),
+        id: new_id.clone(),
         title: derive_title(&exe, dir),
         exe_path: stored_path,
         steam_appid: find_steam_appid(dir),
@@ -3363,6 +4117,8 @@ fn add_game(app: tauri::AppHandle, exe_path: String) -> Result<Vec<Game>, String
     });
 
     save_games(&app, &games)?;
+    // Trophées du jeu qui vient d'être ajouté, sans bloquer l'interface.
+    trigger_trophy_sync(&app, new_id);
     Ok(games)
 }
 
@@ -3476,7 +4232,9 @@ fn launch_game(app: tauri::AppHandle, id: String) -> Result<Vec<Game>, String> {
         if !game_window::focus_pid(pid) {
             eprintln!("[jeu] fenêtre du processus {pid} introuvable pour le focus");
         }
-        let game_root = game_root_dir(&exe);
+        // Le processus tourne déjà : aucune attente de sortie à observer, la
+        // session est reconnue par le dossier et le nom de l'exécutable.
+        let plan = LaunchPlan::build(&exe, &[]);
         let session_app = app.clone();
         let session_id = id;
         std::thread::spawn(move || {
@@ -3486,8 +4244,20 @@ fn launch_game(app: tauri::AppHandle, id: String) -> Result<Vec<Game>, String> {
                     game_id: session_id.clone(),
                 },
             );
-            let (elapsed, exit_code) = monitor_game_processes(&game_root, started, None, false);
-            finish_game_session(&session_app, &session_id, elapsed, exit_code);
+            let exited = AtomicBool::new(true);
+            let fast_failure = AtomicBool::new(false);
+            let exit_code = Mutex::new(None);
+            let exit_at = Mutex::new(Some(Instant::now()));
+            let (elapsed, code) = monitor_game_session(
+                &plan,
+                0,
+                &exited,
+                &fast_failure,
+                &exit_code,
+                &exit_at,
+                started,
+            );
+            finish_game_session(&session_app, &session_id, elapsed, code);
         });
         // Le thread de session devient propriétaire du verrou et le libérera
         // dans finish_game_session.
@@ -3498,10 +4268,11 @@ fn launch_game(app: tauri::AppHandle, id: String) -> Result<Vec<Game>, String> {
     if let Err(error) = run_game_session(app.clone(), exe, title, args, id, started) {
         // Échec du lancement : le launcher ne doit pas rester au premier plan.
         if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
             let _ = window.set_always_on_top(false);
             let _ = window.unminimize();
-            let _ = window.set_focus();
             let _ = window.set_fullscreen(true);
+            let _ = window.set_focus();
         }
         return Err(error);
     }
@@ -3655,6 +4426,8 @@ async fn fetch_game_artwork(app: tauri::AppHandle, game_id: String) -> Result<Ve
         game.bg_url = Some(url);
     }
     save_games(&app, &games)?;
+    // Actualisation des métadonnées : les trophées suivent le nouvel AppID.
+    trigger_trophy_sync(&app, game_id.clone());
     Ok(games)
 }
 
@@ -4013,6 +4786,22 @@ mod tests {
     }
 
     #[test]
+    fn finds_appid_in_emulator_config_files() {
+        let root = std::env::temp_dir().join(format!("ps4-launcher-ini-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("Engine")).unwrap();
+        fs::write(
+            root.join("steam_emu.ini"),
+            "[Settings]\r\nAppId=292030\r\nLanguage=french\r\n",
+        )
+        .unwrap();
+        // Un `steam_appid.txt` reste prioritaire sur toute configuration.
+        assert_eq!(find_steam_appid(&root).as_deref(), Some("292030"));
+        fs::write(root.join("steam_appid.txt"), "489830").unwrap();
+        assert_eq!(find_steam_appid(&root).as_deref(), Some("489830"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn finds_appid_from_steam_appmanifest() {
         let root = std::env::temp_dir().join(format!("ps4-launcher-acf-{}", Uuid::new_v4()));
         let steamapps = root.join("steamapps");
@@ -4059,6 +4848,26 @@ mod tests {
             "The Witcher 3"
         );
         assert_eq!(clean_search_title("Hades.v1.0.0"), "Hades");
+    }
+
+    #[test]
+    fn normalizes_raw_installed_titles() {
+        assert_eq!(clean_search_title("Cyberpunk2077"), "Cyberpunk 2077");
+        assert_eq!(clean_search_title("witcher3"), "witcher 3");
+        assert_eq!(clean_search_title("hollow knight"), "hollow knight");
+        assert_eq!(clean_search_title("Hades-Win64-Shipping"), "Hades");
+        assert_eq!(clean_search_title("Hades-Win64-Shipping.exe"), "Hades");
+    }
+
+    #[test]
+    fn reads_appid_from_emulator_config_files() {
+        assert_eq!(
+            appid_from_config("[Settings]\r\nAppId=292030\r\nUserName=Player\r\n"),
+            Some("292030".to_string())
+        );
+        assert_eq!(appid_from_config("appid = 489830\n"), Some("489830".to_string()));
+        assert_eq!(appid_from_config("AppId=0\n"), None);
+        assert_eq!(appid_from_config("[Settings]\nUnlockAll=1\n"), None);
     }
 
     #[test]
@@ -4274,6 +5083,170 @@ mod tests {
         let picked = pick_best_theme("DOOM", &candidates).expect("unique result");
         assert_eq!(picked.video_id, "a");
     }
+
+    #[test]
+    fn skips_installers_and_crash_helpers_when_scanning() {
+        let root = std::env::temp_dir().join(format!("ps4-launcher-scan-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("bin").join("deep").join("deeper")).unwrap();
+        for name in [
+            "Game.exe",
+            "unins000.exe",
+            "UnityCrashHandler64.exe",
+            "REDprelauncher.exe",
+        ] {
+            fs::write(root.join(name), b"x").unwrap();
+        }
+        fs::write(root.join("bin").join("Helper.exe"), b"x").unwrap();
+        fs::write(
+            root.join("bin")
+                .join("deep")
+                .join("deeper")
+                .join("Hidden.exe"),
+            b"x",
+        )
+        .unwrap();
+
+        let names: Vec<String> = scan_game_executables(&root)
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .collect();
+        assert!(names.iter().any(|name| name == "Game.exe"));
+        assert!(names.iter().any(|name| name == "Helper.exe"));
+        assert!(!names.iter().any(|name| name.starts_with("unins")));
+        assert!(!names.iter().any(|name| name.contains("CrashHandler")));
+        assert!(!names.iter().any(|name| name.starts_with("REDprelauncher")));
+        // Quatrième niveau : hors du périmètre de recherche.
+        assert!(!names.iter().any(|name| name == "Hidden.exe"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Vérifie la fenêtre de grâce et la durée créditée d'une session courte.
+    /// Volontairement ignoré : il dure le temps réel d'une session (≈15 s).
+    /// `cargo test short_direct_session -- --ignored`
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "dure une quinzaine de secondes en temps réel"]
+    fn short_direct_session_stops_after_the_grace_window() {
+        let root = std::env::temp_dir().join(format!("ps4-launcher-short-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let plan = LaunchPlan {
+            program: root.join("Game"),
+            args: Vec::new(),
+            workdir: root.clone(),
+            root,
+            names: HashSet::new(),
+            indirect: false,
+        };
+        let started = Instant::now();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 2")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let child_exited = Arc::new(AtomicBool::new(false));
+        let fast_failure = Arc::new(AtomicBool::new(false));
+        let exit_code = Arc::new(Mutex::new(None));
+        let exit_at = Arc::new(Mutex::new(None));
+        {
+            let child_exited = child_exited.clone();
+            let exit_code = exit_code.clone();
+            let exit_at = exit_at.clone();
+            std::thread::spawn(move || {
+                let status = child.wait();
+                *exit_code.lock().unwrap() = status.ok().and_then(|status| status.code());
+                *exit_at.lock().unwrap() = Some(Instant::now());
+                child_exited.store(true, Ordering::Relaxed);
+            });
+        }
+
+        let (elapsed, code) = monitor_game_session(
+            &plan,
+            pid,
+            &child_exited,
+            &fast_failure,
+            &exit_code,
+            &exit_at,
+            started,
+        );
+        assert_eq!(code, Some(0));
+        assert!(
+            elapsed.as_secs() >= 1 && elapsed.as_secs() <= 3,
+            "durée inattendue: {elapsed:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "attente trop longue: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_a_running_game_process_by_executable_name() {
+        let root = std::env::temp_dir().join(format!("ps4-launcher-session-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        // Le nom est celui du vrai processus : `sleep`, lancé hors du dossier
+        // du jeu, ne peut être reconnu que par son nom.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .current_dir(&root)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+
+        let mut names = HashSet::new();
+        names.insert("sleep".to_string());
+        let plan = LaunchPlan {
+            program: PathBuf::from("/bin/sh"),
+            args: Vec::new(),
+            workdir: root.clone(),
+            root,
+            names,
+            indirect: false,
+        };
+
+        // PID 0 : session adoptée, aucune reconnaissance par PID possible.
+        let mut system = System::new();
+        assert!(find_game_process(&mut system, &plan, 0));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn treats_every_installer_helper_as_utility() {
+        assert!(is_utility_executable("unins000.exe"));
+        assert!(is_utility_executable("VC_redist.x64.exe"));
+        assert!(is_utility_executable("dxsetup.exe"));
+        assert!(is_utility_executable("REDprelauncher.exe"));
+        assert!(!is_utility_executable("GTA5.exe"));
+    }
+
+    #[test]
+    fn resolves_url_shortcuts_to_local_targets() {
+        let root = std::env::temp_dir().join(format!("ps4-launcher-url-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("Game.exe");
+        fs::write(&target, b"x").unwrap();
+        let shortcut = root.join("Game.url");
+        fs::write(
+            &shortcut,
+            format!("[InternetShortcut]\nURL={}\n", target.display()),
+        )
+        .unwrap();
+        assert_eq!(resolve_shortcut(&shortcut), Some(target));
+        // URL distante (Steam) : aucune cible locale à suivre.
+        fs::write(
+            &shortcut,
+            "[InternetShortcut]\nURL=steam://rungameid/730\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_shortcut(&shortcut), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
 
 /* ────────────── Batterie de la manette ────────────── */
@@ -4478,6 +5451,8 @@ pub fn run() {
                     eprintln!("[cache] nettoyage des orphelins impossible: {error}");
                 }
             });
+            // Une passe de trophées, différée et silencieuse.
+            sync_trophies_on_startup(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4506,7 +5481,8 @@ pub fn run() {
             update_profile,
             update_avatar,
             get_controller_battery,
-            trophies::get_game_trophies
+            trophies::get_game_trophies,
+            sync_game_trophies
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
