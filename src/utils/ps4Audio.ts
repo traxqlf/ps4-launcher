@@ -132,13 +132,34 @@ let bgmMuted = readBgmMuted();
 
 /* ─────────────── Verrou audio global : focus + session de jeu ─────────────── */
 
-// `true` uniquement quand la fenêtre est au premier plan et qu'aucun jeu n'est
-// lancé. Le front le pilote via `useAudioGate` ; on démarre ouvert pour que le
-// thème de connexion ne soit jamais coupé par un faux négatif au montage.
+// `true` uniquement quand la fenêtre du launcher est au premier plan. Le front
+// le pilote via `useAudioGate` ; on démarre ouvert pour que le thème de
+// connexion ne soit jamais coupé par un faux négatif au montage.
 let audioAllowed = true;
+// Session de jeu en cours : les bruitages UI restent possibles au retour au
+// launcher, mais aucune musique de fond ne doit reprendre tant que le
+// processus du jeu tourne.
+let gameSessionRunning = false;
 // Pistes HTMLAudioElement interrompues par le verrou, à reprendre au retour.
 let loginThemeGatePaused = false;
 let loginJingleGatePaused = false;
+
+/**
+ * Publie l'état réel de la session de jeu au moteur audio. Une session active
+ * coupe toute musique de fond (menu et thème) sans toucher au moteur ni aux
+ * bruitages UI, qui suivent uniquement le focus de la fenêtre.
+ */
+export function setGameSessionRunning(running: boolean): void {
+  if (gameSessionRunning === running) return;
+  gameSessionRunning = running;
+  if (running) {
+    pauseBgm();
+    return;
+  }
+  // Une demande de musique a pu être mémorisée pendant la partie (fin du
+  // jingle de connexion, reprise différée) : elle part maintenant.
+  if (bgmRequested) resumeBgm();
+}
 
 /** Vrai tant que l'application peut émettre du son (premier plan, hors jeu). */
 export function isAudioAllowed(): boolean {
@@ -197,8 +218,14 @@ export function setAudioAllowed(allowed: boolean): void {
   }
 
   // Musique du menu : seulement si elle était demandée (jamais sous un splash
-  // ni après un lancement) et que rien ne la remplace.
-  if (bgmRequested && !bgmMuted && !loginJingleActive && bgm?.paused) {
+  // ni pendant une session de jeu) et que rien ne la remplace.
+  if (
+    bgmRequested &&
+    !bgmMuted &&
+    !gameSessionRunning &&
+    !loginJingleActive &&
+    bgm?.paused
+  ) {
     playBgmWithFade(GATE_FADE_MS);
   }
 }
@@ -634,6 +661,8 @@ export async function playThemeMusic(
   filePath?: string,
   fadeMs = 800,
 ): Promise<boolean> {
+  // Aucune musique de thème ne doit démarrer sous une session de jeu.
+  if (gameSessionRunning) return false;
   const audio = getContext();
   if (!audio) return false;
   if (audio.state === "suspended") void audio.resume().catch(() => {});
@@ -937,9 +966,9 @@ function watchUnlock() {
 }
 
 function playBgmWithFade(fadeMs = BGM_FADE_MS) {
-  // Verrou fermé : la demande reste en attente (`bgmRequested`), la reprise
-  // partira d'elle-même au retour au premier plan.
-  if (!audioAllowed) return;
+  // Verrou fermé ou jeu en cours : la demande reste en attente
+  // (`bgmRequested`), la reprise partira d'elle-même au bon moment.
+  if (!audioAllowed || gameSessionRunning) return;
   const audio = getBgm();
   if (!audio) return;
   audio.muted = false;
@@ -990,8 +1019,8 @@ export function resumeBgm() {
   bgmRequested = true;
   if (bgmMuted) return;
   // Jeu en cours ou fenêtre en arrière-plan : la demande est mémorisée mais
-  // rien n'est joué avant le retour au premier plan.
-  if (!audioAllowed) return;
+  // rien n'est joué avant la fin de la session et le retour au premier plan.
+  if (gameSessionRunning || !audioAllowed) return;
   // Le jingle de connexion garde la main jusqu'à sa fin.
   if (loginJingleActive) return;
   if (bgm && !bgm.paused) return;

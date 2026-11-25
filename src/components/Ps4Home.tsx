@@ -51,10 +51,8 @@ import {
   playThemeMusic,
   playTrophy,
   previewEffectsVolume,
-  resumeAudioEngine,
   resumeBgm,
   stopThemeMusic,
-  suspendAudioEngine,
   toggleMuteBgm,
   updateAudioSettings,
   type AudioSettings,
@@ -152,10 +150,9 @@ const MAX_FRAME_DT = 0.032;
 const START_IMPULSE = 0.35;
 // Durée de l'écran de démarrage avant de lancer réellement l'exécutable.
 const SPLASH_MS = 1800;
-// Durée minimale du splash : l'animation et le son PS4 se jouent en entier.
-const SPLASH_MIN_MS = 2800;
-// Attente maximale de la fenêtre du jeu avant de rendre la main.
-const SPLASH_TIMEOUT_MS = 45000;
+// Plafond absolu du splash : l'overlay ne doit jamais rester au-delà de ~2,5 s
+// ni bloquer les entrées au retour sur le launcher.
+const SPLASH_AUTO_CLOSE_MS = 2500;
 // Molette / trackpad : un pas de sélection par seuil franchi, verrouillé le
 // temps que l'inertie d'un geste rapide ne saute pas plusieurs tuiles.
 const WHEEL_STEP_THRESHOLD = 45;
@@ -252,11 +249,6 @@ interface GameSessionEnded {
   exitCode?: number | null;
   /** Session très courte terminée avec un code non nul. */
   crashed?: boolean;
-}
-
-/** Fenêtre du jeu affichée : le splash peut se fermer. */
-interface GameWindowReady {
-  gameId: string;
 }
 
 function formatPlaytime(seconds: number): string {
@@ -696,7 +688,10 @@ export function Ps4Home({
   }, [displayGames.length, emptySlots]);
 
   const artworkKey = displayGames
-    .map((game) => `${game.cover_url ?? ""}\n${game.bg_url ?? ""}`)
+    .map(
+      (game) =>
+        `${game.cover_url ?? ""}\n${game.bg_url ?? ""}\n${game.splash_url ?? ""}`,
+    )
     .join("\n");
 
   useEffect(() => {
@@ -704,6 +699,7 @@ export function Ps4Home({
     for (const game of displayGames) {
       preloadImage(game.cover_url);
       preloadImage(game.bg_url);
+      preloadImage(game.splash_url);
     }
     // Le décodage ne dépend que des URLs, pas des autres champs des jeux.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -781,6 +777,7 @@ export function Ps4Home({
       // Tous les processus du jeu sont terminés : la file de musiques peut
       // reprendre, le launcher retrouve un état actif et un nouveau lancement
       // est autorisé.
+      setGamepadSuspended(false);
       setGameSessionActive(false);
       isLaunchingRef.current = false;
       launchInvokedRef.current = false;
@@ -810,8 +807,8 @@ export function Ps4Home({
 
     const creditPlaytime = (payload: GameSessionEnded) => {
       if (disposed || typeof payload?.gameId !== "string") return;
-      // Le launcher retrouve la main : moteur audio, musique et boucle manette.
-      resumeAudioEngine();
+      // Le launcher retrouve la main : la musique et la boucle manette
+      // reprennent au premier plan (le moteur audio suit le focus).
       resumeBgm();
       setGamepadSuspended(false);
       setLaunchingGame(null);
@@ -970,11 +967,13 @@ export function Ps4Home({
     libraryOpen;
 
   // Le hook gamepad global d'App ne doit ni changer de jeu ni lancer pendant
-  // que la barre de fonctions tient la navigation, qu'un jeu démarre ou qu'une
-  // modale est ouverte (elle lit elle-même les manettes).
+  // que la barre de fonctions ou le panneau bas d'un jeu tient la navigation,
+  // qu'un jeu démarre ou qu'une modale est ouverte (elle lit elle-même les
+  // manettes). Tant que le focus n'est pas strictement sur le ruban, Gauche /
+  // Droite restent donc confinés à la zone active.
   useEffect(() => {
     setGlobalGamepadLock(
-      !ready || level === "system" || modalOpen || launchingGame !== null,
+      !ready || level !== "ribbon" || modalOpen || launchingGame !== null,
     );
     return () => setGlobalGamepadLock(false);
   }, [ready, level, modalOpen, launchingGame]);
@@ -2106,30 +2105,28 @@ export function Ps4Home({
     startLaunch(game, () => onLaunchGameRef.current(game.id));
   }
 
-  /** Ferme le splash en cours (jeu prêt, timeout ou annulation manuelle). */
+  /** Ferme le splash en cours (jeu lancé ou annulation manuelle). */
   function cancelSplash() {
     const close = closeSplashRef.current;
     if (!close) return;
+    const gameRunning = launchInvokedRef.current;
     close();
-    // Le jeu déjà lancé continue : la musique du menu revient en attendant.
-    resumeBgm();
+    // Le jeu déjà lancé continue : la musique du menu reste en pause jusqu'à
+    // la fin réelle de sa session. Avant tout lancement, elle revient.
+    if (!gameRunning) resumeBgm();
   }
-  // Le splash reste au premier plan tant que le jeu n'a pas affiché sa
-  // première image, avec une durée minimale et un plafond de 45 s. Rust émet
-  // `game-window-ready` ; le splash ne se ferme que quand les deux conditions
-  // (durée minimale + fenêtre prête) sont réunies. Au-delà de 45 s, on rend
-  // l'accueil plutôt que de laisser le launcher masquer un jeu introuvable.
+
+  // Le splash est borné à ~2,5 s et disparaît dès que la fenêtre perd le
+  // focus : il ne peut plus masquer l'accueil ni bloquer les entrées au
+  // retour d'un jeu. Il n'est remonté que par un nouveau `startLaunch`.
   useEffect(() => {
     if (!launchingGame) return;
-    const gameId = launchingGame.id;
     const appWindow = getCurrentWindow();
     let closed = false;
-    let minElapsed = false;
-    let windowReady = false;
-    let unlisten: (() => void) | undefined;
-    let minTimer = 0;
-    let timeoutTimer = 0;
+    let launched = false;
+    let unlistenFocus: (() => void) | undefined;
     let launchTimer = 0;
+    let autoCloseTimer = 0;
 
     const closeSplash = (gameRunning: boolean) => {
       if (closed) return;
@@ -2141,17 +2138,15 @@ export function Ps4Home({
       if (!gameRunning && !launchInvokedRef.current) {
         isLaunchingRef.current = false;
       }
-      window.clearTimeout(minTimer);
-      window.clearTimeout(timeoutTimer);
       window.clearTimeout(launchTimer);
-      unlisten?.();
-      // Jeu en cours : moteur Web Audio et polling manette suspendus à 0 % CPU
-      // jusqu'au retour au launcher.
+      window.clearTimeout(autoCloseTimer);
+      unlistenFocus?.();
+      window.removeEventListener("blur", onWindowBlur);
       if (gameRunning) {
-        suspendAudioEngine();
+        // La session reste suivie jusqu'à la sortie réelle du processus. Le
+        // moteur audio et la manette ne se mettent en veille que si la
+        // fenêtre du launcher n'est pas au premier plan (useAudioGate).
         setGamepadSuspended(true);
-        // Couvre toute la session, pas seulement le splash : lancement, jeu
-        // en cours, minimisation puis retour au launcher.
         setGameSessionActive(true);
       }
       void appWindow
@@ -2159,63 +2154,69 @@ export function Ps4Home({
         .catch((cause) => console.warn("[splash] alwaysOnTop:", cause));
       setLaunchingGame(null);
     };
-    // Fermeture manuelle (Rond / Échap) : aucun jeu considéré comme lancé.
-    closeSplashRef.current = () => closeSplash(false);
+    // Rond / Échap : si la commande Rust est déjà partie, le jeu continue et
+    // la session reste suivie ; sinon le splash est simplement annulé.
+    closeSplashRef.current = () => closeSplash(launchInvokedRef.current);
 
-    const maybeClose = () => {
-      if (minElapsed && windowReady) closeSplash(true);
+    /** Lance le processus une seule fois, avec un échec toujours nettoyé. */
+    const launchNow = () => {
+      if (launched) return;
+      launched = true;
+      launchInvokedRef.current = true;
+      void Promise.resolve(launchActionRef.current()).catch((cause) => {
+        // Échec du processus : App a affiché l'erreur, on rend l'accueil et
+        // on libère la session pour permettre une nouvelle tentative.
+        console.error("Lancement du jeu:", cause);
+        launchInvokedRef.current = false;
+        isLaunchingRef.current = false;
+        setGameSessionActive(false);
+        setGamepadSuspended(false);
+        setLaunchingGame(null);
+        resumeBgm();
+      });
     };
 
     void appWindow
       .setAlwaysOnTop(true)
       .catch((cause) => console.warn("[splash] alwaysOnTop:", cause));
 
-    minTimer = window.setTimeout(() => {
-      minElapsed = true;
-      maybeClose();
-    }, SPLASH_MIN_MS);
-    timeoutTimer = window.setTimeout(() => {
-      // Fenêtre introuvable : on rend l'accueil et sa musique.
-      closeSplash(false);
-      resumeBgm();
-    }, SPLASH_TIMEOUT_MS);
+    launchTimer = window.setTimeout(launchNow, SPLASH_MS);
+    // Plafond absolu : l'overlay se retire même si la fenêtre du jeu n'est
+    // pas encore détectée par le back.
+    autoCloseTimer = window.setTimeout(() => {
+      closeSplash(launchInvokedRef.current);
+    }, SPLASH_AUTO_CLOSE_MS);
 
-    listen<GameWindowReady>("game-window-ready", (event) => {
-      if (event.payload?.gameId !== gameId) return;
-      windowReady = true;
-      maybeClose();
-    })
+    const onWindowBlur = () => {
+      // Le launcher cède le premier plan au jeu ou passe en arrière-plan :
+      // l'overlay disparaît tout de suite. On déclenche le lancement prévu
+      // s'il ne l'a pas encore été, pour ne pas annuler l'action utilisateur.
+      launchNow();
+      closeSplash(true);
+    };
+    window.addEventListener("blur", onWindowBlur);
+
+    // La WebView minimisée ne relaie pas toujours le blur DOM : l'événement
+    // natif Tauri garantit la fermeture instantanée de l'overlay.
+    void appWindow
+      .onFocusChanged(({ payload: focused }) => {
+        if (!focused) onWindowBlur();
+      })
       .then((stop) => {
         if (closed) stop();
-        else unlisten = stop;
+        else unlistenFocus = stop;
       })
-      .catch((cause) => console.error("Écoute game-window-ready:", cause));
-
-    let launchRequested = false;
-    launchTimer = window.setTimeout(() => {
-      // Un seul appel Rust par splash, même si l'effet a été recréé.
-      if (launchRequested) return;
-      launchRequested = true;
-      launchInvokedRef.current = true;
-      void Promise.resolve(launchActionRef.current()).catch((cause) => {
-        // Échec du processus : App a affiché l'erreur, on rend l'accueil et
-        // on libère le verrou pour permettre une nouvelle tentative.
-        console.error("Lancement du jeu:", cause);
-        launchInvokedRef.current = false;
-        // Même si le splash a déjà été refermé manuellement, l'échec de la
-        // commande Rust doit libérer le verrou de lancement.
-        isLaunchingRef.current = false;
-        closeSplash(false);
-      });
-    }, SPLASH_MS);
+      .catch((cause) =>
+        console.warn("[splash] focus Tauri indisponible:", cause),
+      );
 
     return () => {
       closed = true;
       closeSplashRef.current = null;
-      window.clearTimeout(minTimer);
-      window.clearTimeout(timeoutTimer);
       window.clearTimeout(launchTimer);
-      unlisten?.();
+      window.clearTimeout(autoCloseTimer);
+      unlistenFocus?.();
+      window.removeEventListener("blur", onWindowBlur);
       void appWindow.setAlwaysOnTop(false).catch(() => {});
     };
   }, [launchingGame]);
@@ -2259,7 +2260,11 @@ export function Ps4Home({
     setDrawerFocus(next);
   }
 
-  /** Déplace le curseur interne du tiroir selon la grille affichée. */
+  /**
+   * Déplace le curseur interne du tiroir selon la grille affichée. Les flèches
+   * ne peuvent jamais quitter la zone basse horizontalement : seul Haut depuis
+   * la rangée supérieure (ou Rond / Échap) rend la main au ruban.
+   */
   function drawerStep(direction: "up" | "down" | "left" | "right") {
     // Une tuile permanente n'a qu'une action : Haut rend la main au ruban, le
     // reste est inerte (la tuile ne peut pas être déplacée ni modifiée).
@@ -2272,10 +2277,13 @@ export function Ps4Home({
     let next: DrawerFocus | null = null;
 
     if (direction === "left") {
+      // Colonne de droite → Démarrer, puis rangée d'actions de droite à gauche.
       if (current === "remove_game") next = "pin_game";
       else if (current === "pin_game") next = "refresh_art";
-      else if (current !== "start") next = "start";
+      else if (current === "trophies" || current === "launch_options")
+        next = "start";
     } else if (direction === "right") {
+      // Démarrer → carte Trophées ; rangée d'actions de gauche à droite.
       if (current === "start") next = "trophies";
       else if (current === "refresh_art") next = "pin_game";
       else if (current === "pin_game") next = "remove_game";
@@ -2283,16 +2291,17 @@ export function Ps4Home({
       if (current === "start") next = "trophies";
       else if (current === "trophies") next = "launch_options";
       else if (current === "launch_options") next = "refresh_art";
+      // Bas depuis la rangée d'actions : rien (on ne remonte jamais au ruban).
+    } else if (current === "launch_options") {
+      next = "trophies";
     } else if (
       current === "refresh_art" ||
       current === "pin_game" ||
       current === "remove_game"
     ) {
       next = "launch_options";
-    } else if (current === "launch_options") {
-      next = "trophies";
     } else {
-      // Haut depuis le sommet du tiroir : retour au bandeau principal.
+      // Haut uniquement depuis la rangée supérieure : retour au ruban.
       backToRibbon();
       return;
     }
@@ -2523,13 +2532,24 @@ export function Ps4Home({
     onSelect(next);
   }
 
-  // Gauche/Droite sont gérés par App sur le ruban et par la barre de fonctions
-  // quand le focus est dans le menu du haut.
+  // Gauche/Droite : ruban via App, barre de fonctions en mode système, et
+  // grille 2D du panneau bas quand un jeu est ouvert. Le verrou global empêche
+  // App de faire défiler le ruban dans ces deux dernières zones.
   useGamepad({
-    onLeft:
-      inputBlocked || level !== "system" ? undefined : () => moveHeader(-1),
-    onRight:
-      inputBlocked || level !== "system" ? undefined : () => moveHeader(1),
+    onLeft: inputBlocked
+      ? undefined
+      : level === "system"
+        ? () => moveHeader(-1)
+        : level === "info"
+          ? () => drawerStep("left")
+          : undefined,
+    onRight: inputBlocked
+      ? undefined
+      : level === "system"
+        ? () => moveHeader(1)
+        : level === "info"
+          ? () => drawerStep("right")
+          : undefined,
     onUp:
       inputBlocked || level === "system"
         ? undefined

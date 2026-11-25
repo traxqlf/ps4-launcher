@@ -5,6 +5,10 @@ export interface Game {
   steam_appid: string | null;
   cover_url: string | null;
   bg_url: string | null;
+  /** Image plein écran dédiée au splash (16:9 / 3:2). */
+  splash_url?: string | null;
+  /** Vrai après une tentative de récupération du splash, même sans résultat. */
+  splash_checked?: boolean;
   last_played: number | null;
   playtime_seconds: number;
   launch_options: string;

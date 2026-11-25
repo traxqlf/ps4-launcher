@@ -84,11 +84,19 @@ export interface GamepadOptions {
 }
 
 let globalInputLocked = false;
-// Deux causes distinctes de suspension, combinées en un seul drapeau : une
-// session de jeu (splash puis partie) et une fenêtre en arrière-plan (pilotée
-// par le verrou audio `useAudioGate`).
-let gamepadGameSuspended = false;
-let gamepadBackgroundSuspended = false;
+// « Jeu en cours » et « launcher en veille » sont deux états distincts. Un jeu
+// continue de tourner après un Alt-Tab, mais le launcher doit redevenir
+// immédiatement navigable dès qu'il reprend le focus.
+let gameRunning = false;
+let windowFocused = true;
+if (typeof document !== "undefined") {
+  windowFocused = !document.hidden && document.hasFocus();
+}
+// Veille de jeu : un jeu tourne ET le launcher n'a pas le focus. Le launcher
+// en arrière-plan est également mis en veille hors session, pour ne laisser
+// aucune boucle active (0 % CPU).
+let gameSuspended = false;
+let backgroundSuspended = false;
 let gamepadSuspended = false;
 
 /** Bloque les hooks globaux pendant qu'une zone locale navigue. */
@@ -148,8 +156,8 @@ function gamepadActivity(): boolean {
   return false;
 }
 
-// Une session de jeu arrête complètement le polling : plus aucune boucle
-// requestAnimationFrame ne tourne tant que le launcher est en arrière-plan.
+// La veille arrête complètement le polling : plus aucune boucle
+// requestAnimationFrame ne tourne tant que la fenêtre est en arrière-plan.
 const suspensionListeners = new Set<(suspended: boolean) => void>();
 
 /** Prévient les écouteurs souris globaux des suspensions de la boucle manette. */
@@ -163,31 +171,47 @@ export function subscribeGamepadSuspension(
 }
 
 function syncSuspension() {
-  const next = gamepadGameSuspended || gamepadBackgroundSuspended;
+  gameSuspended = gameRunning && !windowFocused;
+  backgroundSuspended = !windowFocused;
+  const next = gameSuspended || backgroundSuspended;
+
+  // Les animations CSS du launcher se figent aussi hors premier plan :
+  // aucun travail de composition GPU en arrière-plan.
+  if (typeof document !== "undefined") {
+    document.documentElement.classList.toggle(
+      "ps4-launcher-suspended",
+      backgroundSuspended,
+    );
+  }
+
   if (gamepadSuspended === next) return;
   gamepadSuspended = next;
   for (const listener of suspensionListeners) listener(next);
 }
 
-/** Suspend (ou relance) la boucle manette pendant une session de jeu. */
-export function setGamepadSuspended(suspended: boolean) {
-  if (gamepadGameSuspended === suspended) return;
-  gamepadGameSuspended = suspended;
+/**
+ * Signale qu'une session de jeu est active. Ce drapeau seul ne suspend aucune
+ * entrée : la veille n'est effective que si la fenêtre du launcher perd le
+ * focus, puis le retour au premier plan réveille l'interface aussitôt.
+ */
+export function setGamepadSuspended(gameIsRunning: boolean) {
+  if (gameRunning === gameIsRunning) return;
+  gameRunning = gameIsRunning;
   syncSuspension();
 }
 
 /**
- * Suspend la boucle manette quand la fenêtre passe en arrière-plan : plus aucun
- * requestAnimationFrame ne tourne (0 % CPU launcher). La manette reste lue
- * pendant le splash, la fenêtre étant alors au premier plan.
+ * Suit le focus réel de la fenêtre (DOM + événement natif Tauri, via
+ * `useAudioGate`). Fenêtre au premier plan : la boucle et les entrées
+ * reprennent immédiatement, même si un jeu tourne encore en arrière-plan.
  */
-export function setGamepadBackgroundSuspended(suspended: boolean) {
-  if (gamepadBackgroundSuspended === suspended) return;
-  gamepadBackgroundSuspended = suspended;
+export function setGamepadWindowFocused(focused: boolean) {
+  if (windowFocused === focused) return;
+  windowFocused = focused;
   syncSuspension();
 }
 
-/** Vrai pendant une session de jeu : aucune entrée du launcher n'est lue. */
+/** Vrai quand le launcher est en veille : aucune entrée n'est lue. */
 export function isGamepadSuspended(): boolean {
   return gamepadSuspended;
 }

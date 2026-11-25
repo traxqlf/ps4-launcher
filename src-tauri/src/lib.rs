@@ -26,6 +26,12 @@ pub struct Game {
     pub cover_url: Option<String>,
     #[serde(default)]
     pub bg_url: Option<String>,
+    /// Image plein écran dédiée au splash (16:9 ou 3:2), distincte du fond héros.
+    #[serde(default)]
+    pub splash_url: Option<String>,
+    /// Vrai après une tentative de récupération du splash, même sans résultat.
+    #[serde(default)]
+    pub splash_checked: bool,
     #[serde(default)]
     pub last_played: Option<u64>,
     #[serde(default)]
@@ -438,6 +444,7 @@ async fn search_steam_appid(
 // ---------------------------------------------------------------------------
 
 const STEAM_ARTWORK: &str = "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps";
+const STEAM_STORE_API: &str = "https://store.steampowered.com/api/appdetails";
 const STEAMGRIDDB_API: &str = "https://www.steamgriddb.com/api/v2";
 /// Protocole Tauri qui sert `app_data_dir/covers/` sans activer l'asset protocol.
 const COVERS_SCHEME: &str = "ps4covers";
@@ -483,6 +490,7 @@ const VERSION_KEYWORDS: [&str; 7] = [
 enum ArtworkKind {
     Cover,
     Hero,
+    Splash,
 }
 
 impl ArtworkKind {
@@ -490,6 +498,7 @@ impl ArtworkKind {
         match self {
             ArtworkKind::Cover => "cover",
             ArtworkKind::Hero => "hero",
+            ArtworkKind::Splash => "splash",
         }
     }
 }
@@ -820,6 +829,151 @@ async fn download_image(
         .map_err(|e| format!("écriture de {} impossible: {e}", destination.display()))
 }
 
+/* ─────────────── Splash plein écran : dimensions et ratio ─────────────── */
+
+/// Un splash exploitable remplit l'écran : pas de bandeau panoramique.
+const SPLASH_MIN_WIDTH: u32 = 1280;
+const SPLASH_MIN_RATIO: f64 = 1.45;
+const SPLASH_MAX_RATIO: f64 = 1.85;
+
+fn is_splash_ratio(width: u32, height: u32) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let ratio = width as f64 / height as f64;
+    (SPLASH_MIN_RATIO..=SPLASH_MAX_RATIO).contains(&ratio)
+}
+
+fn le24(bytes: &[u8]) -> Option<u32> {
+    let slice = bytes.get(0..3)?;
+    Some(u32::from(slice[2]) << 16 | u32::from(slice[1]) << 8 | u32::from(slice[0]))
+}
+
+/// Lit les dimensions sans décoder l'image : JPEG, PNG et WebP suffisent aux
+/// sources Steam Store et SteamGridDB.
+fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() >= 24
+        && &bytes[0..8] == b"\x89PNG\r\n\x1a\n"
+        && &bytes[12..16] == b"IHDR"
+    {
+        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return (width > 0 && height > 0).then_some((width, height));
+    }
+
+    if bytes.len() >= 16 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return match &bytes[12..16] {
+            b"VP8X" if bytes.len() >= 30 => Some((le24(&bytes[24..])? + 1, le24(&bytes[27..])? + 1)),
+            b"VP8 " if bytes.len() >= 30 => {
+                let payload = 20usize;
+                if bytes.get(payload + 3..payload + 6) != Some(&[0x9d, 0x01, 0x2a]) {
+                    return None;
+                }
+                let width = u16::from_le_bytes(bytes[payload + 6..payload + 8].try_into().ok()?)
+                    & 0x3fff;
+                let height = u16::from_le_bytes(bytes[payload + 8..payload + 10].try_into().ok()?)
+                    & 0x3fff;
+                Some((u32::from(width), u32::from(height)))
+            }
+            b"VP8L" if bytes.len() >= 25 => {
+                if bytes[20] != 0x2f {
+                    return None;
+                }
+                let bits = u32::from_le_bytes(bytes[21..25].try_into().ok()?);
+                Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+            }
+            _ => None,
+        };
+    }
+
+    if bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        let mut index = 2usize;
+        while index + 1 < bytes.len() {
+            if bytes[index] != 0xFF {
+                index += 1;
+                continue;
+            }
+            let mut marker = bytes[index + 1];
+            index += 2;
+            while marker == 0xFF && index < bytes.len() {
+                marker = bytes[index];
+                index += 1;
+            }
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                continue;
+            }
+            // Les dimensions précèdent toujours le début des données compressées.
+            if marker == 0xD9 || marker == 0xDA {
+                return None;
+            }
+            if index + 2 > bytes.len() {
+                return None;
+            }
+            let length = usize::from(u16::from_be_bytes([bytes[index], bytes[index + 1]]));
+            if length < 2 || index + length > bytes.len() {
+                return None;
+            }
+            if matches!(
+                marker,
+                0xC0 | 0xC1
+                    | 0xC2
+                    | 0xC3
+                    | 0xC5
+                    | 0xC6
+                    | 0xC7
+                    | 0xC9
+                    | 0xCA
+                    | 0xCB
+                    | 0xCD
+                    | 0xCE
+                    | 0xCF
+            ) {
+                if length < 7 {
+                    return None;
+                }
+                let height =
+                    u32::from(u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]));
+                let width =
+                    u32::from(u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]));
+                return (width > 0 && height > 0).then_some((width, height));
+            }
+            index += length;
+        }
+    }
+
+    None
+}
+
+/// Télécharge un candidat et ne l'écrit qu'après validation de son ratio réel.
+/// Un bandeau `3840x1240` est donc rejeté avant de remplacer un bon cache.
+async fn download_splash_image(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+) -> Option<(u32, u32)> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    if bytes.len() < 1024 {
+        return None;
+    }
+    let (width, height) = image_dimensions(&bytes)?;
+    if width < SPLASH_MIN_WIDTH || !is_splash_ratio(width, height) {
+        return None;
+    }
+    fs::write(destination, &bytes).ok()?;
+    Some((width, height))
+}
+
+fn splash_file_is_valid(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| image_dimensions(&bytes))
+        .is_some_and(|(width, height)| width >= SPLASH_MIN_WIDTH && is_splash_ratio(width, height))
+}
+
 fn steam_candidates(appid: &str, kind: ArtworkKind) -> Vec<String> {
     let base = format!("{STEAM_ARTWORK}/{appid}");
     match kind {
@@ -833,6 +987,9 @@ fn steam_candidates(appid: &str, kind: ArtworkKind) -> Vec<String> {
             format!("{base}/library_hero.jpg"),
             format!("{base}/header.jpg"),
         ],
+        // Le splash est servi par l'API Store ou SteamGridDB, puis validé par
+        // ses dimensions réelles : aucun bandeau ultra-large n'est accepté.
+        ArtworkKind::Splash => Vec::new(),
     }
 }
 
@@ -851,6 +1008,126 @@ async fn steamgriddb_hero_url(
     }
     let payload: serde_json::Value = response.json().await.ok()?;
     best_sgdb_image_url(payload.get("data")?.as_array()?, (3840, 1240))
+}
+
+/// Candidats plein écran de la fiche Store officielle : captures 16:9 puis
+/// arrière-plan brut. Les dimensions réelles sont vérifiées au téléchargement.
+async fn steam_store_splash_candidates(client: &reqwest::Client, appid: &str) -> Vec<String> {
+    let url = format!("{STEAM_STORE_API}?appids={appid}&l=french");
+    let response = client.get(&url).send().await.ok();
+    let Some(response) = response else {
+        return Vec::new();
+    };
+    if !response.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(payload) = response.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    let Some(data) = payload
+        .get(appid)
+        .and_then(|entry| entry.get("data"))
+        .filter(|data| data.is_object())
+    else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    if let Some(screenshots) = data.get("screenshots").and_then(serde_json::Value::as_array) {
+        for screenshot in screenshots.iter().take(8) {
+            if let Some(path) = screenshot
+                .get("path_full")
+                .and_then(serde_json::Value::as_str)
+            {
+                candidates.push(path.to_string());
+            }
+        }
+    }
+    if let Some(background) = data
+        .get("background_raw")
+        .and_then(serde_json::Value::as_str)
+    {
+        candidates.push(background.to_string());
+    }
+    if let Some(movies) = data.get("movies").and_then(serde_json::Value::as_array) {
+        for movie in movies.iter().take(3) {
+            if let Some(thumbnail) = movie
+                .get("thumbnail")
+                .and_then(serde_json::Value::as_str)
+            {
+                candidates.push(thumbnail.to_string());
+            }
+        }
+    }
+    // Doublons retirés sans réordonner : les captures restent prioritaires.
+    let mut unique = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+/// Héros SteamGridDB strictement 16:9 / 3:2, par appid puis par nom.
+async fn sgdb_splash_hero_by_id(
+    client: &reqwest::Client,
+    api_key: &str,
+    path: &str,
+) -> Option<String> {
+    let url = format!(
+        "{STEAMGRIDDB_API}/heroes/{path}?dimensions=1920x1080,3840x2160,2160x1440&types=static&nsfw=false&humor=false"
+    );
+    let response = client.get(&url).bearer_auth(api_key).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let payload: serde_json::Value = response.json().await.ok()?;
+    let items = payload.get("data")?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    best_sgdb_image_url(items, (1920, 1080))
+}
+
+async fn steamgriddb_splash_url(
+    client: &reqwest::Client,
+    api_key: &str,
+    appid: Option<&str>,
+    title: &str,
+) -> Option<String> {
+    if let Some(appid) = appid {
+        if let Some(url) = sgdb_splash_hero_by_id(client, api_key, &format!("steam/{appid}")).await
+        {
+            return Some(url);
+        }
+    }
+
+    let cleaned = clean_search_title(title);
+    if cleaned.trim().is_empty() {
+        return None;
+    }
+    let search_url = format!(
+        "{STEAMGRIDDB_API}/search/autocomplete/{}",
+        encode_path_segment(cleaned.trim())
+    );
+    let response = client
+        .get(&search_url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let payload: serde_json::Value = response.json().await.ok()?;
+    let sgdb_id = payload
+        .get("data")?
+        .as_array()?
+        .first()?
+        .get("id")?
+        .as_u64()?;
+    sgdb_splash_hero_by_id(client, api_key, &format!("game/{sgdb_id}")).await
 }
 
 /// Encodage minimal d'un segment de chemin pour la recherche SteamGridDB.
@@ -4106,6 +4383,8 @@ fn add_game(app: tauri::AppHandle, exe_path: String) -> Result<Vec<Game>, String
         steam_appid: find_steam_appid(dir),
         cover_url: None,
         bg_url: None,
+        splash_url: None,
+        splash_checked: false,
         last_played: None,
         playtime_seconds: 0,
         launch_options: String::new(),
@@ -4292,6 +4571,45 @@ fn add_playtime(app: tauri::AppHandle, game_id: String, seconds: u64) -> Result<
     Ok(games)
 }
 
+/// Télécharge le meilleur splash disponible et renvoie son URL cachetée.
+/// L'ordre respecte la fiche Store (captures 16:9, fond brut), puis
+/// SteamGridDB filtré sur les dimensions plein écran.
+async fn acquire_splash_image(
+    client: &reqwest::Client,
+    api_key: &str,
+    appid: Option<&str>,
+    title: &str,
+    directory: &Path,
+    game_id: &str,
+    stamp: u64,
+) -> Option<String> {
+    let file = covers_file(game_id, ArtworkKind::Splash);
+    let destination = directory.join(&file);
+    let mut saved = false;
+
+    if let Some(appid) = appid {
+        for candidate in steam_store_splash_candidates(client, appid).await {
+            if download_splash_image(client, &candidate, &destination)
+                .await
+                .is_some()
+            {
+                saved = true;
+                break;
+            }
+        }
+    }
+
+    if !saved && !api_key.is_empty() {
+        if let Some(url) = steamgriddb_splash_url(client, api_key, appid, title).await {
+            saved = download_splash_image(client, &url, &destination)
+                .await
+                .is_some();
+        }
+    }
+
+    saved.then(|| cached_artwork_url(&file, stamp))
+}
+
 #[tauri::command]
 async fn fetch_game_artwork(app: tauri::AppHandle, game_id: String) -> Result<Vec<Game>, String> {
     let games = load_games(&app)?;
@@ -4403,6 +4721,30 @@ async fn fetch_game_artwork(app: tauri::AppHandle, game_id: String) -> Result<Ve
         }
     }
 
+    // Splash plein écran dédié : 16:9 / 3:2 uniquement. Le cache ultra-large
+    // existant (ancien héros) est détecté par ses dimensions réelles puis
+    // remplacé ; un bon splash déjà en cache n'est pas retéléchargé.
+    let splash_file = covers_file(&game_id, ArtworkKind::Splash);
+    let splash_path = directory.join(&splash_file);
+    let cached_splash_valid = splash_file_is_valid(&splash_path);
+    let mut splash_url_update: Option<String> = None;
+    let mut splash_attempted = false;
+    if !cached_splash_valid {
+        splash_attempted = true;
+        splash_url_update = acquire_splash_image(
+            &client,
+            &api_key,
+            appid_ref,
+            &title,
+            &directory,
+            &game_id,
+            stamp,
+        )
+        .await;
+    } else if games[index].splash_url.is_none() {
+        splash_url_update = Some(cached_artwork_url(&splash_file, stamp));
+    }
+
     // Relecture juste avant d'écrire : une session terminée pendant les appels
     // réseau a pu créditer du temps de jeu ou changer l'ordre récent. Seuls les
     // champs d'artwork de ce jeu sont modifiés sur la version fraîche.
@@ -4422,9 +4764,98 @@ async fn fetch_game_artwork(app: tauri::AppHandle, game_id: String) -> Result<Ve
     if let Some(url) = hero_url_update {
         game.bg_url = Some(url);
     }
+    if let Some(url) = splash_url_update {
+        game.splash_url = Some(url);
+    }
+    if splash_attempted {
+        game.splash_checked = true;
+    }
     save_games(&app, &games)?;
     // Actualisation des métadonnées : les trophées suivent le nouvel AppID.
     trigger_trophy_sync(&app, game_id.clone());
+    Ok(games)
+}
+
+#[tauri::command]
+async fn ensure_game_splash(app: tauri::AppHandle, game_id: String) -> Result<Vec<Game>, String> {
+    let games = load_games(&app)?;
+    let game = games
+        .iter()
+        .find(|game| game.id == game_id)
+        .ok_or_else(|| format!("jeu introuvable: {game_id}"))?;
+    let title = game.title.clone();
+    let steam_appid = game.steam_appid.clone();
+    let splash_url = game.splash_url.clone();
+    let splash_checked = game.splash_checked;
+
+    let directory = covers_dir(&app)?;
+    let splash_file = covers_file(&game_id, ArtworkKind::Splash);
+    let splash_path = directory.join(&splash_file);
+    let cached_valid = splash_file_is_valid(&splash_path);
+
+    if cached_valid {
+        if splash_url.is_some() {
+            return Ok(games);
+        }
+        let mut games = load_games(&app)?;
+        if let Some(game) = games.iter_mut().find(|game| game.id == game_id) {
+            game.splash_url = Some(cached_artwork_url(&splash_file, now_millis()));
+        }
+        save_games(&app, &games)?;
+        return Ok(games);
+    }
+
+    // Une tentative déjà faite sans résultat n'est pas répétée à chaque
+    // lancement ; l'actualisation explicite des jaquettes reste prioritaire.
+    if splash_checked && splash_url.is_none() {
+        return Ok(games);
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("ps4-launcher/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("client HTTP indisponible: {e}"))?;
+
+    let mut appid = steam_appid;
+    let mut discovered_appid: Option<String> = None;
+    if appid.is_none() {
+        if let Some(found) = search_steam_appid(&client, &title).await? {
+            discovered_appid = Some(found.clone());
+            appid = Some(found);
+        }
+    }
+    let api_key = load_profile(&app)
+        .map(|profile| profile.steamgriddb_api_key)
+        .unwrap_or_default();
+    let api_key = api_key.trim().to_string();
+
+    let splash_update = acquire_splash_image(
+        &client,
+        &api_key,
+        appid.as_deref(),
+        &title,
+        &directory,
+        &game_id,
+        now_millis(),
+    )
+    .await;
+
+    let mut games = load_games(&app)?;
+    let game = games
+        .iter_mut()
+        .find(|game| game.id == game_id)
+        .ok_or_else(|| format!("jeu introuvable: {game_id}"))?;
+    if let Some(found) = discovered_appid {
+        if game.steam_appid.is_none() {
+            game.steam_appid = Some(found);
+        }
+    }
+    if let Some(url) = splash_update {
+        game.splash_url = Some(url);
+    }
+    game.splash_checked = true;
+    save_games(&app, &games)?;
     Ok(games)
 }
 
@@ -4902,7 +5333,40 @@ mod tests {
             covers_file("abc-123", ArtworkKind::Hero),
             "abc-123_hero.jpg"
         );
+        assert_eq!(
+            covers_file("abc-123", ArtworkKind::Splash),
+            "abc-123_splash.jpg"
+        );
         assert_eq!(covers_file("a/../b", ArtworkKind::Hero), "a____b_hero.jpg");
+    }
+
+    #[test]
+    fn splash_accepts_only_fullscreen_ratios() {
+        assert!(is_splash_ratio(1920, 1080));
+        assert!(is_splash_ratio(3840, 2160));
+        assert!(is_splash_ratio(2160, 1440));
+        assert!(!is_splash_ratio(3840, 1240));
+        assert!(!is_splash_ratio(1920, 620));
+        assert!(!is_splash_ratio(0, 0));
+    }
+
+    #[test]
+    fn reads_dimensions_from_png_and_jpeg_headers() {
+        let mut png = vec![0u8; 24];
+        png[0..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[12..16].copy_from_slice(b"IHDR");
+        png[16..20].copy_from_slice(&1920u32.to_be_bytes());
+        png[20..24].copy_from_slice(&1080u32.to_be_bytes());
+        assert_eq!(image_dimensions(&png), Some((1920, 1080)));
+
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]);
+        jpeg.extend_from_slice(&[0u8; 14]);
+        jpeg.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        jpeg.extend_from_slice(&1440u16.to_be_bytes());
+        jpeg.extend_from_slice(&2160u16.to_be_bytes());
+        jpeg.extend_from_slice(&[0u8; 10]);
+        assert_eq!(image_dimensions(&jpeg), Some((2160, 1440)));
     }
 
     #[test]
@@ -5474,6 +5938,7 @@ pub fn run() {
             add_playtime,
             cleanup_orphan_cache,
             fetch_game_artwork,
+            ensure_game_splash,
             get_profile,
             update_profile,
             update_avatar,

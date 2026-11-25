@@ -1093,6 +1093,14 @@ body.input-mode-gamepad * {
   }
 }
 
+/* Veille du launcher : fenêtre en arrière-plan, aucun travail GPU d'animation.
+   Les transitions restent définies pour reprendre proprement au réveil. */
+.ps4-launcher-suspended *,
+.ps4-launcher-suspended *::before,
+.ps4-launcher-suspended *::after {
+  animation-play-state: paused !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .ps4-screen,
   .ps4-particles,
